@@ -21,12 +21,17 @@
 
 #import "SLFCommon.h"
 #import <mach/mach.h>
-#import <mach/mach_vm.h>
 #import <mach/thread_act.h>
 #import <mach/arm/thread_status.h>
 #import <pthread.h>
 #import <dlfcn.h>
 #import <CoreFoundation/CoreFoundation.h>
+
+// 注意：不要 #import <mach/mach_vm.h>。
+// iOS SDK 里该头文件是占位桩，内容只有一行 `#error mach_vm.h unsupported.`
+// （仅 macOS 提供）。iOS 上用 <mach/mach.h> 里的 vm_read_overwrite 即可，
+// 语义相同：把目标进程内存读进本进程缓冲区，越界只返回错误码、不会崩。
+// 这正是"抓栈时不崩"的关键保证。
 
 #pragma mark - 地址掩码
 
@@ -46,10 +51,21 @@ static _Atomic bool gWatchdogRunning = false;
 // 卡顿时长统计（用于日志摘要，不参与判定）
 static SLFStat gStallStat;
 
-// 去重与配额：放在文件作用域，避免函数内 static 的初始化时机歧义。
+// 定时器强引用。
+// 必须集中持有并被真正读取：dispatch_source 一旦被释放，其事件处理器会静默停止触发
+// （表现为"看门狗装上了但从不报警"）。只在函数内赋值属于"只写不读"，
+// 既会触发 -Wunused-but-set-variable，也无法表达"持有引用"的意图。
+static dispatch_source_t gTickTimer = NULL;
+static dispatch_source_t gBeatTimer = NULL;
+static dispatch_source_t gStatTimer = NULL;
+
+#pragma mark - 去重与配额
 static _Atomic bool gReporting = false;
 static _Atomic int  gReportCount = 0;
 static _Atomic uint64_t gLastReportedNS = 0;
+
+// 前置声明：SLFWatchdogHealthCheck 定义在下方，但被上方的定时器 block 引用。
+void SLFWatchdogHealthCheck(void);
 
 #pragma mark - 栈回溯
 
@@ -111,12 +127,12 @@ static void SLFCaptureThreadStack(mach_port_t thread, NSString **outText) {
     uint64_t curFP = fp;
     for (int i = 1; i < SLF_MAX_FRAMES && curFP != 0; i++) {
         uint64_t frame[2] = {0, 0};
-        mach_vm_size_t outSize = 0;
-        kern_return_t r = mach_vm_read_overwrite(task,
-                                                 (mach_vm_address_t)curFP,
-                                                 sizeof(frame),
-                                                 (mach_vm_address_t)(uintptr_t)frame,
-                                                 &outSize);
+        vm_size_t outSize = 0;
+        kern_return_t r = vm_read_overwrite(task,
+                                            (vm_address_t)curFP,
+                                            (vm_size_t)sizeof(frame),
+                                            (vm_address_t)(uintptr_t)frame,
+                                            &outSize);
         if (r != KERN_SUCCESS || outSize != sizeof(frame)) break;
 
         uint64_t nextFP = SLF_STRIP(frame[0]);
@@ -229,6 +245,18 @@ static void SLFWatchdogTick(void) {
     atomic_store(&gReporting, false);
 }
 
+// 看门狗自身的存活检查。
+// 用途一：把三个定时器引用真正"读"一次，避免 -Wunused-but-set-variable；
+// 用途二：这是有实际价值的自检 —— 定时器被释放后看门狗会静默失效，
+//         定期打印存活状态能在日志里直接看出"看门狗还活着吗"。
+void SLFWatchdogHealthCheck(void) {
+    SLFLog(@"[watchdog] alive tick=%d beat=%d stat=%d reports=%d",
+           gTickTimer != NULL,
+           gBeatTimer != NULL,
+           gStatTimer != NULL,
+           (int)atomic_load(&gReportCount));
+}
+
 #pragma mark - 启动
 
 static void SLFStartWatchdogOnce(void) {
@@ -256,9 +284,8 @@ static void SLFStartWatchdogOnce(void) {
         return;
     }
 
-    // 定时器必须被强引用住，否则被释放后静默失效（曾踩过这个坑）。
-    static dispatch_source_t sTimer = NULL;
-    sTimer = timer;
+    // 存入文件作用域强引用槽位。
+    gTickTimer = timer;
 
     uint64_t interval = 100ull * NSEC_PER_MSEC;
     dispatch_source_set_timer(timer,
@@ -286,8 +313,7 @@ static void SLFStartWatchdogOnce(void) {
     dispatch_source_t beatTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
         dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
     if (beatTimer != NULL) {
-        static dispatch_source_t sBeatTimer = NULL;
-        sBeatTimer = beatTimer;
+        gBeatTimer = beatTimer;
         dispatch_source_set_timer(beatTimer,
                                   dispatch_time(DISPATCH_TIME_NOW, interval),
                                   interval, 10ull * NSEC_PER_MSEC);
@@ -309,14 +335,14 @@ static void SLFStartWatchdogOnce(void) {
         dispatch_source_t statTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
             dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
         if (statTimer != NULL) {
-            static dispatch_source_t sStatTimer = NULL;
-            sStatTimer = statTimer;
+            gStatTimer = statTimer;
             uint64_t iv = (uint64_t)dumpInterval * NSEC_PER_SEC;
             dispatch_source_set_timer(statTimer,
                                       dispatch_time(DISPATCH_TIME_NOW, iv), iv,
                                       1ull * NSEC_PER_SEC);
             dispatch_source_set_event_handler(statTimer, ^{
                 @try {
+                    SLFWatchdogHealthCheck();
                     SLFDumpStats();
                 } @catch (__unused NSException *e) {}
             });

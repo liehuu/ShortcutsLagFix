@@ -75,6 +75,14 @@ def main():
         body = strip_comments(open(f, encoding="utf-8").read())
         for m in re.finditer(r"#\s*define\s+(SLF\w+)\s*\(", body):
             macros.add(m.group(1))
+        # .m 内的前置声明也算已声明（C 要求先声明后使用）
+        for m in re.finditer(
+                r"^(?:extern\s+)?(void|BOOL|NSInteger|uint64_t|NSString)\s*\*?\s*"
+                r"(SLF\w+)\s*\(([^;{]*)\)\s*;", body, re.M):
+            name, args = m.group(2), m.group(3)
+            if name not in protos:
+                nargs = 0 if args.strip() in ("", "void") else len(split_args(args))
+                protos[name] = (m.group(1), nargs)
 
     # 检查调用实参个数
     for f in sorted(glob.glob(os.path.join(SRC, "*.m"))):

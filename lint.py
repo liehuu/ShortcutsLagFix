@@ -311,6 +311,60 @@ def check_constructor(f, lines):
                 err(f, i, "[15] 构造函数缺少 @try（异常会影响宿主启动）")
 
 
+# ---------- [16] iOS SDK 不支持的 macOS 专属头文件 ----------
+# 2026-10-28 真实 CI 失败：SLFWatchdog.m 用了 <mach/mach_vm.h>，
+# iOS SDK 里该文件是占位桩（内容仅一行 `#error mach_vm.h unsupported.`），
+# 连带 mach_vm_read_overwrite 声明也不存在 → 隐式函数声明 → 编译失败。
+# 本机无 clang，无法提前发现。改由 lint 静态拦截。
+IOS_UNSUPPORTED_HEADERS = {
+    "mach/mach_vm.h": "iOS 不支持，改用 <mach/mach.h> 的 vm_read_overwrite",
+    "sys/kdebug.h": "iOS 不公开",
+    "libproc.h": "iOS 大幅裁剪，多数接口不存在",
+}
+
+
+def check_ios_headers(f, lines):
+    # 必须在"去掉注释"的代码上判定。
+    # 首次实现直接扫原始行，结果把注释里写的 `#import <mach/mach_vm.h>` 也当成
+    # 真实引用报了错（说明这一行本身不该报）。注释里的例子不能算违规。
+    code_lines = strip_comment_lines(lines)
+    for i, ln in enumerate(code_lines, 1):
+        m = re.search(r'#\s*(?:include|import)\s*[<"]([^>"]+)[>"]', ln)
+        if not m:
+            continue
+        h = m.group(1)
+        if h in IOS_UNSUPPORTED_HEADERS:
+            err(f, i, "[16] <%s> 在 iOS SDK 不可用：%s" %
+                (h, IOS_UNSUPPORTED_HEADERS[h]))
+
+
+# ---------- [17] 只写不读的 static 变量 ----------
+def check_set_but_unused(f, lines):
+    """检测 `static X y = NULL; ... y = z;` 之后从未读取的模式。
+
+    判定：赋值次数 >= 1，且"非赋值出现次数" == 0。
+    "非赋值出现"指变量名出现在不是赋值左侧的位置，例如
+      gLogQueue ?: ...      ← 读
+      if (gTick != NULL)     ← 读
+      gTick = timer;         ← 写，不算
+    注意 `?:` 前的变量名不含 '='，所以不会被误判成赋值。
+    """
+    body = "\n".join(strip_comment_lines(lines))
+    for m in re.finditer(r'^\s*static\s+[\w\s\*]+?\b(\w+)\s*=\s*NULL\s*;',
+                         body, re.M):
+        var = m.group(1)
+        # 所有出现位置
+        occ = [mm.start() for mm in re.finditer(r'\b%s\b' % re.escape(var), body)]
+        assign_pos = set()
+        for mm in re.finditer(r'\b%s\s*=(?!=)' % re.escape(var), body):
+            assign_pos.add(mm.start())
+        reads = [p for p in occ if p not in assign_pos]
+        # 容差必须为 0：声明行 `static X y = NULL;` 已被计入 assign_pos，
+        # 不会再残留在 reads 里。写 <=1 会把"只读 1 次"的正常变量误报（已踩）。
+        if len(assign_pos) >= 1 and len(reads) == 0:
+            warn(f, 1, "[17] static %s 只赋值从不读取（-Wunused-but-set-variable）" % var)
+
+
 def main():
     files = sources()
     if not files:
@@ -334,6 +388,8 @@ def main():
         check_lock_logging(f, lines)
         check_timer_static(f, lines)
         check_constructor(f, lines)
+        check_ios_headers(f, lines)
+        check_set_but_unused(f, lines)
 
     for w in warnings:
         print("[WARN] " + w)
