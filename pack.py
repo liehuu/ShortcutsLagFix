@@ -29,7 +29,7 @@ OUTDEB = os.path.join(ROOT, "debs")
 
 NAME = "shortcutslagfix"
 PKG = "com.liehuu.shortcutslagfix"
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 
 # ---------------------------------------------------------------------------
 # Architecture 不是 CPU 架构，而是【包布局标志】。这是 RootHide 踩过的最大的坑：
@@ -117,7 +117,7 @@ def check_dylib():
 def check_layout():
     dl = os.path.join(LAYOUT, "Library/MobileSubstrate/DynamicLibraries")
     pl = os.path.join(dl, "ShortcutsLagFix.plist")
-    cfg = os.path.join(LAYOUT, "var/mobile/Library/Preferences/com.liehuu.shortcutslagfix.plist")
+    postinst = os.path.join(LAYOUT, "DEBIAN/postinst")
 
     if not os.path.exists(pl):
         die("缺少注入过滤 plist: " + pl)
@@ -126,11 +126,33 @@ def check_layout():
     if "com.apple.shortcuts" not in content and "is.workflow.my.app" not in content:
         die("过滤 plist 不含目标 bundle id，插件永不会被加载")
 
-    if not os.path.exists(cfg):
-        die("缺少预置配置文件: " + cfg)
-
     if not os.path.exists(os.path.join(dl, "ShortcutsLagFix.dylib")):
         die("layout 里没有 dylib，先跑 build.sh")
+
+    # ★ data.tar 里绝不允许出现 /var/mobile 下的条目。
+    #
+    # dpkg 以 root 解包，tar 的目录条目会变成 root:wheel 755。而快捷指令
+    # App 以 mobile 身份运行，在 root 拥有的目录里建不了文件，于是
+    # 「日志目录存在但一条日志都没有」—— 现场看起来像插件没被加载。
+    # 这些目录一律由 postinst 创建并 chown 给 mobile。
+    # 参考实现（同一打包管线、同设备装成功）的 data.tar 里同样没有任何 var/ 条目。
+    var_dir = os.path.join(LAYOUT, "var")
+    if os.path.exists(var_dir):
+        die("layout 下存在 var/ 目录。data.tar 不得携带 /var/mobile 条目："
+            "dpkg 会以 root 属主创建它们，App(mobile) 无法写入，"
+            "导致日志目录为空。请把目录创建移到 layout/DEBIAN/postinst 里。")
+
+    if not os.path.exists(postinst):
+        die("缺少 postinst: " + postinst)
+    with open(postinst, "rb") as f:
+        pi = f.read()
+    if not pi.startswith(b"#!/bin/sh"):
+        die("postinst 缺少 '#!/bin/sh' 首行，dpkg 无法执行它")
+    if not pi.endswith(b"\n"):
+        die("postinst 末尾缺少换行（与 control 同一类问题）")
+    # 关键判据：postinst 必须真的把目录 chown 给 mobile，否则等于没做。
+    if b"chown" not in pi or b"Logs/ShortcutsLagFix" not in pi:
+        die("postinst 未对日志目录执行 chown，App(mobile) 仍无法写日志")
 
     print("[pack] layout 校验 OK")
 
@@ -231,11 +253,24 @@ def validate_control_text(raw):
     return problems
 
 
-def tar_dir(src_dir, out_path, arc_root="."):
-    """构建 tar.gz，规范化权限与属主。"""
+def tar_dir(src_dir, out_path, arc_root=".", exclude_top=()):
+    """构建 tar.gz，规范化权限与属主。
+
+    exclude_top: 需要跳过的顶层条目名。用来把 layout/DEBIAN 排除在
+    data.tar 之外 —— DEBIAN 下的脚本属于 control.tar，混进 data.tar 会被
+    装到设备的 /DEBIAN/ 目录里，既是垃圾也可能被 dpkg 误读。
+    """
+    # dpkg 会直接 exec control.tar 里的维护脚本，权限必须是 755。
+    # 按文件名判定而不是靠 checkout 的权限位：Windows/CI 上权限位不可信。
+    script_names = {"postinst", "preinst", "postrm", "prerm", "config", "templates"}
+
     with tarfile.open(out_path, "w:gz", format=tarfile.GNU_FORMAT) as tar:
         for root, dirs, files in os.walk(src_dir):
             dirs.sort()
+            # 根层级过滤：只对 src_dir 直接子项生效，不误伤深层同名目录
+            if os.path.abspath(root) == os.path.abspath(src_dir):
+                dirs[:] = [d for d in dirs if d not in exclude_top]
+                files = [f for f in files if f not in exclude_top]
             for d in dirs:
                 full = os.path.join(root, d)
                 rel = os.path.relpath(full, src_dir)
@@ -254,9 +289,12 @@ def tar_dir(src_dir, out_path, arc_root="."):
                 ti.gid = 0
                 ti.uname = "root"
                 ti.gname = "wheel"
-                # 按扩展名判定，不依赖 os.access（CI 上 check-out 的权限位不可靠）。
-                # dylib 必须可读可加载 -> 755；其余配置文件 644。
-                ti.mode = 0o755 if f.endswith(".dylib") else 0o644
+                # 按扩展名/文件名判定，不依赖 os.access（CI 上 check-out 的权限位不可靠）。
+                # dylib 必须可读可加载 -> 755；维护脚本必须可 exec -> 755；其余 644。
+                if f.endswith(".dylib") or f in script_names:
+                    ti.mode = 0o755
+                else:
+                    ti.mode = 0o644
                 with open(full, "rb") as fh:
                     tar.addfile(ti, fh)
 
@@ -293,15 +331,21 @@ def build_deb():
     ctrl_dir = os.path.join(work, "control")
     os.makedirs(ctrl_dir)
 
-    # control.tar.gz
+    # control.tar.gz —— 由 control 与 DEBIAN/ 下的维护脚本组成
     with open(os.path.join(ctrl_dir, "control"), "wb") as f:
         f.write(make_control())
+    # 维护脚本必须放进 control.tar，且必须是 755（dpkg 直接 exec 它）。
+    for script in ("postinst", "preinst", "postrm", "prerm"):
+        src = os.path.join(LAYOUT, "DEBIAN", script)
+        if os.path.exists(src):
+            shutil.copyfile(src, os.path.join(ctrl_dir, script))
     ctrl_tar = os.path.join(work, "control.tar.gz")
     tar_dir(ctrl_dir, ctrl_tar)
 
-    # data.tar.gz
+    # data.tar.gz —— 排除 DEBIAN：那里面的东西属于 control.tar，
+    # 混进 data.tar 会被装到设备的 /DEBIAN/ 下，且 dpkg 不会执行它们。
     data_tar = os.path.join(work, "data.tar.gz")
-    tar_dir(LAYOUT, data_tar)
+    tar_dir(LAYOUT, data_tar, exclude_top=("DEBIAN",))
 
     # 组装 ar
     with open(deb_path, "wb") as af:
@@ -420,12 +464,42 @@ def verify_deb(deb_path):
     must = [
         "./Library/MobileSubstrate/DynamicLibraries/ShortcutsLagFix.dylib",
         "./Library/MobileSubstrate/DynamicLibraries/ShortcutsLagFix.plist",
-        "./var/mobile/Library/Preferences/com.liehuu.shortcutslagfix.plist",
     ]
     for m in must:
         if m not in got:
             die("data 内缺少必需文件: " + m + "\n实际清单:\n  " + "\n  ".join(got))
-    print("[pack] data 清单校验 OK (%d 项)" % len(got))
+
+    # ★ data.tar 不得携带 /var/ 条目，也不得带 DEBIAN/。
+    # 这是真实事故：把 /var/mobile/Library/Logs/ShortcutsLagFix 放进 data.tar 后，
+    # dpkg 以 root:wheel 755 创建它，App(mobile) 写不进去，
+    # 表现是「日志目录存在但一条日志都没有」，看起来像插件没加载。
+    bad = [n for n in got if n.startswith("./var") or "/DEBIAN" in n or n.startswith("./DEBIAN")]
+    if bad:
+        die("data.tar 含禁止的条目（属主会是 root，App 无法写；或维护脚本混入 data）：\n  "
+            + "\n  ".join(bad))
+    print("[pack] data 清单校验 OK (%d 项，无 /var 条目)" % len(got))
+
+    # ★ control.tar 必须带可执行的 postinst（它负责把 /var/mobile 下的目录
+    # 建好并 chown 给 mobile）。少了它，日志目录的权限问题会再次出现。
+    with open(tmpc2 := os.path.join(BUILD, "_verify_control.tar.gz"), "wb") as g:
+        g.write(ctrl_blob)
+    try:
+        with tarfile.open(tmpc2, "r:gz") as tar:
+            cm = {m.name.lstrip("./"): m for m in tar.getmembers()}
+            if "postinst" not in cm:
+                die("control.tar.gz 里缺少 postinst，安装后无人创建/chown 日志目录")
+            mode = cm["postinst"].mode & 0o777
+            if mode != 0o755:
+                die("postinst 权限为 %o，dpkg 需要 755 才能执行" % mode)
+            body = tar.extractfile(cm["postinst"]).read()
+            if b"chown" not in body:
+                die("postinst 里没有 chown，日志目录仍会归 root，App 写不进去")
+            if not body.endswith(b"\n"):
+                die("postinst 末尾缺少换行")
+    finally:
+        if os.path.exists(tmpc2):
+            os.remove(tmpc2)
+    print("[pack] control.tar 含 postinst(755) 且已 chown mobile，OK")
 
     with open(deb_path, "rb") as f:
         sha = hashlib.sha256(f.read()).hexdigest()

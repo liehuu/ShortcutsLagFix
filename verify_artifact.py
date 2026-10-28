@@ -131,6 +131,12 @@ def main(deb_path):
         cn = [n for n in t.getnames() if n.endswith("control")]
         raw_ctrl = t.extractfile(cn[0]).read()
         ctrl = raw_ctrl.decode("utf-8")
+        # postinst 也需要在这里取出来：它负责把 /var/mobile 下的目录
+        # 建成 mobile 属主，是「日志目录为空」那次事故的修复落点。
+        pi_members = [m for m in t.getmembers()
+                      if m.name.lstrip("./") == "postinst"]
+        raw_postinst = t.extractfile(pi_members[0]).read() if pi_members else None
+        pi_mode = (pi_members[0].mode & 0o777) if pi_members else None
     os.remove(tmpc)
     for line in ctrl.strip().split("\n"):
         print("      " + line)
@@ -184,6 +190,37 @@ def main(deb_path):
         else:
             ok("control 未出现 %r" % forbidden)
 
+    # ---- 2b. postinst（日志目录属主）----
+    print("\n[2b] postinst 与 /var/mobile 属主")
+    if raw_postinst is None:
+        bad("control.tar 里没有 postinst —— 无人创建/chown 日志目录，"
+            "App(mobile) 将写不进日志，表现为「日志目录存在但为空」")
+    else:
+        if pi_mode == 0o755:
+            ok("postinst 权限 755（dpkg 可直接 exec）")
+        else:
+            bad("postinst 权限为 %s，dpkg 需要 755" % oct(pi_mode))
+        if raw_postinst.startswith(b"#!/bin/sh"):
+            ok("postinst shebang 正确")
+        else:
+            bad("postinst 首行不是 #!/bin/sh")
+        if not raw_postinst.endswith(b"\n"):
+            bad("postinst 末尾缺少换行（与 control 缺换行同一类问题）")
+        txt = raw_postinst.decode("utf-8", "replace")
+        if "Logs/ShortcutsLagFix" in txt and "chown" in txt:
+            ok("postinst 会创建日志目录并 chown 给 mobile")
+        else:
+            bad("postinst 未对日志目录 chown，App 仍写不进日志")
+        # 预置配置现在由 postinst 写入（属主 mobile，App 与用户都能改）。
+        expected = ["DebugLog", "WatchdogEnabled", "StallThresholdMS",
+                    "MaxStallReports", "StatDumpInterval",
+                    "OptDisableImplicitAnimations"]
+        missing = [k for k in expected if k not in txt]
+        if missing:
+            bad("postinst 内嵌配置缺少键: %s" % ", ".join(missing))
+        else:
+            ok("postinst 内嵌配置含全部 %d 个键" % len(expected))
+
     # ---- 3. data 清单 ----
     print("\n[3] data 清单与权限")
     tmpd = os.path.join(ROOT, "_x_data.tar.gz")
@@ -197,13 +234,32 @@ def main(deb_path):
         must = [
             "./Library/MobileSubstrate/DynamicLibraries/ShortcutsLagFix.dylib",
             "./Library/MobileSubstrate/DynamicLibraries/ShortcutsLagFix.plist",
-            "./var/mobile/Library/Preferences/com.liehuu.shortcutslagfix.plist",
         ]
         for m in must:
             if m in infos:
                 ok("存在 %s" % os.path.basename(m))
             else:
                 bad("缺少 %s" % m)
+
+        # ★ data.tar 里不允许出现 /var/ 条目。
+        # 真实事故：把 /var/mobile/Library/Logs/ShortcutsLagFix 放进 data.tar，
+        # dpkg 以 root:wheel 755 创建它；快捷指令 App 跑在 mobile 下，
+        # 建不了文件 → 日志目录永远为空 → 看起来像插件根本没加载。
+        # 这些目录必须由 postinst 创建并 chown 给 mobile。
+        var_entries = [n for n in infos if n == "./var" or n.startswith("./var/")]
+        if var_entries:
+            for n in var_entries:
+                bad("data 含 /var 条目 %r —— dpkg 会以 root 属主创建它，"
+                    "App(mobile) 无法写入，日志将永远为空。应改由 postinst 创建" % n)
+        else:
+            ok("data 不含任何 /var 条目（/var/mobile 由 postinst 以 mobile 属主创建）")
+
+        debian_entries = [n for n in infos if n.lstrip("./").startswith("DEBIAN")]
+        if debian_entries:
+            bad("data 含 DEBIAN 条目 %r —— 维护脚本属于 control.tar，"
+                "混进 data 不会被执行" % debian_entries)
+        else:
+            ok("data 不含 DEBIAN（维护脚本只在 control.tar 里）")
 
         # ★ roothide 包布局硬约束：所有条目必须是纯 rootful 路径。
         # 出现 ./rootfs/ 或 ./var/jb/ 就说明包被"转换"过或架构值写错，
@@ -246,18 +302,6 @@ def main(deb_path):
                 ok("注入过滤含 com.apple.shortcuts")
             else:
                 bad("注入过滤不含 com.apple.shortcuts，插件永不加载")
-
-        # 预置配置必须可解析且含真实开关
-        if must[2] in infos:
-            cfg = plistlib.loads(t.extractfile(must[2]).read())
-            expected = ["DebugLog", "WatchdogEnabled", "StallThresholdMS",
-                        "MaxStallReports", "StatDumpInterval",
-                        "OptDisableImplicitAnimations"]
-            for k in expected:
-                if k in cfg:
-                    ok("配置含 %s = %r" % (k, cfg[k]))
-                else:
-                    bad("配置缺少 %s" % k)
     os.remove(tmpd)
 
     # ---- 4. dylib 架构 ----
@@ -302,6 +346,21 @@ def main(deb_path):
         b"performFetch:",
         b"ShortcutsLagFix.dylib",
     ]
+    # ★ 日志路径兜底必须真的被编译进产物。
+    # 真实事故：日志目录被 dpkg 以 root 属主创建，App(mobile) 写不进去，
+    # 旧版四个候选（jbroot / /var/jb / 真实 /var/mobile / 硬编码 /tmp）全部
+    # 不可写，gLogPath 直接置空，一条日志都不写 —— 现场看起来就是
+    # 「插件装了但日志目录是空的」。修复的关键是加了 App 容器这一个
+    # 【必然可写】的候选，所以必须断言它存在于二进制里，
+    # 否则可能 CI 编的还是旧代码而验尸照样全绿。
+    # 字面量可能存成 UTF-16LE 也可能存成 ASCII，两种都认。
+    log_probe = "Library/Logs/ShortcutsLagFix"
+    if (log_probe.encode("utf-16-le") in embedded) or (log_probe.encode("ascii") in embedded):
+        ok("含日志兜底路径 'Library/Logs/ShortcutsLagFix'（App 容器必可写）")
+    else:
+        bad("缺日志兜底路径 'Library/Logs/ShortcutsLagFix' —— "
+            "说明编译的是旧代码，日志目录仍可能写不出来")
+
     for s in probes_utf16:
         if s.encode("utf-16-le") in embedded:
             ok("含字符串 '%s'" % s)

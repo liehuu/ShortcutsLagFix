@@ -92,27 +92,53 @@ static void SLFSetupLogUnsafe(void) {
     // 候选 2/3：真实路径与 rootless 路径
     [dirs addObject:@"/var/mobile/Library/Logs/ShortcutsLagFix"];
     [dirs addObject:@"/var/jb/var/mobile/Library/Logs/ShortcutsLagFix"];
-    // 候选 4：last resort，一定可写
-    [dirs addObject:@"/tmp/ShortcutsLagFix"];
+    // 候选 4：App 自己容器内的 Library/Logs —— 【一定可写】。
+    // 为什么必须有这一条：上面几条都依赖包安装时建好目录并把属主改成 mobile。
+    // 如果目录是 dpkg 以 root 建的（属主 root:wheel 755），App 进程（mobile）
+    // 创建文件会被拒，于是所有候选都失败、gLogPath 保持 nil，
+    // 最终表现是「目录存在但一条日志都没有」——看起来像插件没被加载，
+    // 实际是日志设施把失败咽掉了，完全无法分辨。
+    // App 容器归 mobile 所有，写入必然成功，作为兜底可以把两者区分开。
+    NSString *home = NSHomeDirectory();
+    if (home.length) {
+        [dirs addObject:[home stringByAppendingPathComponent:@"Library/Logs/ShortcutsLagFix"]];
+    }
+    // 候选 5：容器 tmp。注意不要用硬编码 "/tmp"：
+    // iOS 上真实 /tmp 属主是 root、权限 755，App 同样写不进去，是死候选。
+    NSString *tmp = NSTemporaryDirectory();
+    if (tmp.length) {
+        [dirs addObject:[tmp stringByAppendingPathComponent:@"ShortcutsLagFix"]];
+    }
 
     NSFileManager *fm = [NSFileManager defaultManager];
     NSString *chosen = nil;
+    NSMutableString *diag = [NSMutableString string];
 
     for (NSString *dir in dirs) {
         NSError *err = nil;
-        if (![fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:&err]) {
-            // 目录可能已存在，继续尝试写探测文件来判定真实可写性
-        }
+        // 目录已存在时 createDirectory 返回 YES，所以「成功」不代表可写，
+        // 必须再写一个探测文件才能判定 App 是否真的有权限落盘。
+        [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:&err];
         NSString *probe = [dir stringByAppendingPathComponent:@".wtest"];
         BOOL ok = [@"x" writeToFile:probe atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+        [diag appendFormat:@"    %@ -> %@\n", dir, ok ? @"可写" : @"不可写"];
         if (ok) {
             [fm removeItemAtPath:probe error:NULL];
-            chosen = dir;
-            break;
+            if (chosen == nil) chosen = dir;
         }
     }
 
-    if (chosen == nil) return;
+    // 依次尝试所有候选，能写就选第一个；顺序决定优先级：
+    // 主路径（用户方便查看） > App 容器（必然可写）。
+    if (chosen == nil) {
+        // 一条都写不进去。此路径下不能再调日志函数，只能 stderr。
+        fprintf(stderr, "[ShortcutsLagFix] 所有日志候选均不可写，禁用日志:\n%s",
+                diag.UTF8String);
+        return;
+    }
+
+    // 把探测结果与最终选择直接写进 stderr，便于通过终端/系统日志定位。
+    fprintf(stderr, "[ShortcutsLagFix] 日志路径 = %s\n%s", chosen.UTF8String, diag.UTF8String);
 
     gLogPath = [chosen stringByAppendingPathComponent:@"ShortcutsLagFix.log"];
 

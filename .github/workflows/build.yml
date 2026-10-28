@@ -62,15 +62,42 @@ jobs:
             exit 1
           }
 
-      - name: 确认预置配置文件存在
+      - name: 确认预置文件存在
         run: |
           # test_pack.py 曾在真实 layout 上做删除测试，把交付文件删掉导致 CI 失败。
           # 现在测试已隔离到临时目录，这里再确认一次生产文件完好。
-          test -f layout/var/mobile/Library/Preferences/com.liehuu.shortcutslagfix.plist \
-            || { echo "::error::预置配置缺失（可能被测试污染）"; exit 1; }
+          test -f layout/DEBIAN/postinst \
+            || { echo "::error::postinst 缺失（负责 chown 日志目录）"; exit 1; }
           test -f layout/Library/MobileSubstrate/DynamicLibraries/ShortcutsLagFix.plist \
             || { echo "::error::注入过滤 plist 缺失"; exit 1; }
+          # data.tar 绝不能带 /var/mobile 条目：dpkg 会以 root 属主创建目录，
+          # 而 App 跑在 mobile 下，写不进去 -> 日志目录永远为空。
+          test ! -e layout/var \
+            || { echo "::error::layout/var 存在，日志目录会被建成 root 属主"; exit 1; }
           echo "预置文件完好"
+
+      - name: postinst 属主修复守卫
+        run: |
+          # 真实事故：日志目录 /var/mobile/Library/Logs/ShortcutsLagFix 曾被
+          # data.tar 以 root:wheel 755 创建，App(mobile) 建不了文件，
+          # 于是「装了插件但日志目录是空的」，看起来像插件根本没被加载。
+          #
+          # 修复方式：目录改由 postinst 创建并 chown 给 mobile。
+          # 这里断言 postinst 真的做了这件事，否则等于没修。
+          # 注意读原始文件，不用 $(cat ...)：命令替换会吃掉尾随换行，
+          # 而「末尾必须有换行」本身就是一条要守的约束。
+          test -x layout/DEBIAN/postinst || chmod +x layout/DEBIAN/postinst
+          head -1 layout/DEBIAN/postinst | grep -qx '#!/bin/sh' \
+            || { echo "::error::postinst 缺少 #!/bin/sh"; exit 1; }
+          grep -q 'Logs/ShortcutsLagFix' layout/DEBIAN/postinst \
+            || { echo "::error::postinst 未提及日志目录"; exit 1; }
+          grep -q 'chown' layout/DEBIAN/postinst \
+            || { echo "::error::postinst 未 chown，日志目录仍归 root"; exit 1; }
+          # 末尾换行：直接看最后一个字节
+          [ "$(tail -c 1 layout/DEBIAN/postinst | od -An -c | tr -d ' \n')" = '\n' ] \
+            || { echo "::error::postinst 末尾缺换行"; exit 1; }
+          echo "postinst 守卫通过"
+
 
       - name: roothide 包格式专项守卫
         run: |

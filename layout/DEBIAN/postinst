@@ -1,0 +1,78 @@
+#!/bin/sh
+#
+# 安装后脚本。
+#
+# 存在的唯一理由：本包**故意不在 data.tar 里携带 /var/mobile 下的任何条目**。
+#
+# 原因：dpkg 以 root 身份解包，tar 里的目录条目属主会变成 root:wheel。
+# 而「快捷指令」App 以 mobile 用户运行，对 root:wheel 755 的目录没有写权限，
+# 于是日志目录虽然存在，dylib 却一个字也写不进去 —— 现场表现为
+# 「装了插件，日志目录是空的」，看起来像根本没被加载，实际是权限问题。
+#
+# 所以这些目录一律在这里创建，并把属主显式改成 mobile，让 App 能写。
+# 预置配置同理：App 与用户都要能改，属主也必须是 mobile。
+
+# 不开 set -e：这里的每一条都是为了「尽量修好」，单条失败不应中断整包安装。
+# 全部加 || true，避免 chown 在个别环境（用户未定义）下让 dpkg 报错。
+
+MOBILE_UID=501
+MOBILE_GID=501
+
+# 兼容写法：优先按用户名，失败再按数字 uid/gid。
+as_mobile() {
+    chown mobile:mobile "$1" 2>/dev/null || chown "$MOBILE_UID:$MOBILE_GID" "$1" 2>/dev/null || true
+}
+
+LOG_DIR=/var/mobile/Library/Logs/ShortcutsLagFix
+mkdir -p "$LOG_DIR" 2>/dev/null || true
+as_mobile "$LOG_DIR"
+chmod 755 "$LOG_DIR" 2>/dev/null || true
+
+# 修复旧版遗留：早先的 control 把这两个系统目录一并声明进 data.tar，
+# 属主可能已被改成 root:wheel。iOS 默认就是 mobile:mobile，
+# 恢复它，否则 App 连自己的偏好都写不了。
+for d in /var/mobile/Library/Logs /var/mobile/Library/Preferences; do
+    if [ -d "$d" ]; then
+        as_mobile "$d"
+        chmod 755 "$d" 2>/dev/null || true
+    fi
+done
+
+# 预置配置：只在不存在时写入，不覆盖用户已有配置。
+CONF=/var/mobile/Library/Preferences/com.liehuu.shortcutslagfix.plist
+if [ ! -f "$CONF" ]; then
+    mkdir -p /var/mobile/Library/Preferences 2>/dev/null || true
+    cat > "$CONF" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>DebugLog</key>
+	<true/>
+	<key>WatchdogEnabled</key>
+	<true/>
+	<key>StallThresholdMS</key>
+	<integer>250</integer>
+	<key>MaxStallReports</key>
+	<integer>40</integer>
+	<key>StatDumpInterval</key>
+	<integer>30</integer>
+	<key>OptDisableImplicitAnimations</key>
+	<true/>
+</dict>
+</plist>
+PLIST
+    as_mobile "$CONF"
+    chmod 644 "$CONF" 2>/dev/null || true
+fi
+
+printf '\n'
+printf 'ShortcutsLagFix 已安装。\n'
+printf '重启快捷指令使其加载：killall -9 Shortcuts\n'
+printf '\n'
+printf '日志目录：%s\n' "$LOG_DIR"
+printf '若该目录为空，说明 dylib 未被加载；请改用下面的命令定位实际日志：\n'
+printf '  find /var/mobile/Containers/Data/Application -name "ShortcutsLagFix.log" 2>/dev/null\n'
+printf '\n'
+
+exit 0

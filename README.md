@@ -98,17 +98,42 @@ killall -9 Shortcuts
 2. 点「新建快捷指令」，复现卡顿。
 3. 退出 App，查看日志。
 
-日志路径（多候选自动探测，**日志首行会自报实际生效路径**）：
+日志路径（多候选自动探测，选第一个**真正可写**的；**日志首行会自报实际生效路径**）：
 
 ```
 <jbroot>/var/mobile/Library/Logs/ShortcutsLagFix/ShortcutsLagFix.log
 /var/mobile/Library/Logs/ShortcutsLagFix/ShortcutsLagFix.log
-/tmp/ShortcutsLagFix/ShortcutsLagFix.log
+/var/jb/var/mobile/Library/Logs/ShortcutsLagFix/ShortcutsLagFix.log
+<App 容器>/Library/Logs/ShortcutsLagFix/ShortcutsLagFix.log       ← 必然可写，兜底
+<App 容器>/tmp/ShortcutsLagFix/ShortcutsLagFix.log
 ```
 
 `<jbroot>` 在 RootHide 环境下形如
 `/var/mobile/Containers/Shared/AppGroup/.jbroot-<HASH>/`，
 **每台设备哈希不同**，请以日志首行打印的路径为准。
+
+### 目录存在但日志为空？
+
+这是**已经踩过一次**的坑，原因不是插件没加载，而是**权限**：
+
+dpkg 以 root 解包，如果 `data.tar` 里带了 `/var/mobile/Library/Logs/ShortcutsLagFix`，
+这个目录的属主就是 `root:wheel 755`。而快捷指令 App 跑在 **mobile** 用户下，
+在 root 拥有的 755 目录里**创建不了文件**，于是 dylib 的写探测全部失败，
+`gLogPath` 被置空，一条日志都不落 —— 看起来就是「插件装了但什么也没有」。
+
+现在的做法：
+
+- `data.tar` **完全不携带** `/var/mobile` 下的任何条目（可用 `dpkg-deb -c` 自查）
+- 目录由 `postinst` 创建，并 `chown mobile:mobile`
+- dylib 侧另加 App 容器这个**必然可写**的候选作为兜底
+
+如果主路径仍为空，用下面命令定位实际日志（能搜到 = dylib 已被加载）：
+
+```bash
+find /var/mobile/Containers/Data/Application -name "ShortcutsLagFix.log" 2>/dev/null
+```
+
+一条都搜不到，才说明 dylib 根本没被加载器载入，那是另一个问题（注入目录 / 签名 / 过滤 plist）。
 
 ### 日志怎么读
 
@@ -129,7 +154,10 @@ killall -9 Shortcuts
 ## 配置
 
 编辑 `/var/mobile/Library/Preferences/com.liehuu.shortcutslagfix.plist`，
-**修改后需重启快捷指令 App** 才生效：
+**修改后需重启快捷指令 App** 才生效。
+
+该文件由安装脚本 `postinst` 创建，属主是 `mobile`（不是 root），
+所以 App 和你都能读写。配置缺失时插件会退回内置默认值，不会因此不工作。
 
 | 键 | 类型 | 默认 | 说明 |
 |---|---|---|---|

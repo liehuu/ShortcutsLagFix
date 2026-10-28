@@ -94,10 +94,21 @@ def main():
         f.write("<plist><dict><key>Filter</key><dict><key>Bundles</key>"
                 "<array><string>com.apple.shortcuts</string></array>"
                 "</dict></dict></plist>")
-    pref = os.path.join(pack.LAYOUT, "var/mobile/Library/Preferences")
-    os.makedirs(pref, exist_ok=True)
-    with open(os.path.join(pref, "com.liehuu.shortcutslagfix.plist"), "w") as f:
-        f.write("<plist><dict><key>DebugLog</key><true/></dict></plist>")
+    # 不在 layout 里放 var/：data.tar 一旦携带 /var/mobile 条目，
+    # dpkg 会以 root:wheel 创建目录，App(mobile) 就写不进去了。
+    # 这些目录由 postinst 创建并 chown。
+    debian = os.path.join(pack.LAYOUT, "DEBIAN")
+    os.makedirs(debian, exist_ok=True)
+    with open(os.path.join(debian, "postinst"), "w") as f:
+        f.write("#!/bin/sh\n"
+                'LOG_DIR=/var/mobile/Library/Logs/ShortcutsLagFix\n'
+                'mkdir -p "$LOG_DIR"\n'
+                'chown mobile:mobile "$LOG_DIR"\n'
+                'CONF=/var/mobile/Library/Preferences/com.liehuu.shortcutslagfix.plist\n'
+                'if [ ! -f "$CONF" ]; then cat > "$CONF" <<\'PLIST\'\n'
+                "<plist><dict><key>DebugLog</key><true/></dict></plist>\n"
+                "PLIST\nfi\n"
+                "exit 0\n")
     print("    layout OK")
 
     print("=== 3. 打包 ===")
@@ -221,17 +232,24 @@ def main():
         need = [
             "./Library/MobileSubstrate/DynamicLibraries/ShortcutsLagFix.dylib",
             "./Library/MobileSubstrate/DynamicLibraries/ShortcutsLagFix.plist",
-            "./var/mobile/Library/Preferences/com.liehuu.shortcutslagfix.plist",
         ]
         for n in need:
             assert n in found, "data 缺少 %s\n实际: %s" % (n, list(found))
         dyl = found[need[0]]
-        cfg = found[need[2]]
         assert dyl.mode == 0o755, "dylib 权限应为 755，实际 %o" % dyl.mode
-        assert cfg.mode == 0o644, "配置权限应为 644，实际 %o" % cfg.mode
         assert dyl.uid == 0 and dyl.uname == "root", "属主应为 root"
         print("    dylib: mode=%o uid=%d" % (dyl.mode, dyl.uid))
-        print("    config: mode=%o" % cfg.mode)
+
+        # ★ data.tar 不得含 /var 与 DEBIAN 条目。
+        # /var 条目会被 dpkg 以 root 属主创建 -> App(mobile) 写不进日志。
+        # 这是真实事故，必须作为回归用例常驻。
+        badv = [n for n in found if n == "./var" or n.startswith("./var/")]
+        assert not badv, (
+            "data.tar 含 /var 条目 %r：dpkg 会以 root:wheel 创建它们，"
+            "App(mobile) 无法写入，日志目录会永远为空" % badv)
+        badd = [n for n in found if n.lstrip("./").startswith("DEBIAN")]
+        assert not badd, "data.tar 含 DEBIAN 条目 %r，维护脚本属于 control.tar" % badd
+        print("    data 无 /var 与 DEBIAN 条目 OK")
 
     # 内嵌 dylib 必须与源文件逐字节一致
     with tarfile.open(data_path, "r:gz") as t:
@@ -244,14 +262,34 @@ def main():
     pack.verify_deb(deb)
     print("    verify_deb 通过")
 
-    print("=== 8. 硬闸门：缺失 plist 时必须失败 ===")
-    os.remove(os.path.join(pref, "com.liehuu.shortcutslagfix.plist"))
+    print("=== 8. 硬闸门：postinst 缺失时必须失败 ===")
+    # postinst 是「日志目录归 mobile」的唯一落点，缺了它日志永远写不出来。
+    pi_path = os.path.join(pack.LAYOUT, "DEBIAN", "postinst")
+    os.remove(pi_path)
     try:
         pack.check_layout()
-        print("    [FAIL] 缺配置未报错，闸门失效")
+        print("    [FAIL] 缺 postinst 未报错，闸门失效")
         return 1
     except SystemExit as e:
         print("    正确拦截（exit %s）" % e.code)
+
+    print("=== 8b. 硬闸门：layout/var 存在时必须失败 ===")
+    # 只要 layout 里出现 var/，data.tar 就会带上 root 属主的目录，
+    # App(mobile) 写不进去 -> 复现「日志目录存在但为空」的事故。
+    with open(pi_path, "w") as f:
+        f.write("#!/bin/sh\n"
+                "LOG_DIR=/var/mobile/Library/Logs/ShortcutsLagFix\n"
+                'mkdir -p "$LOG_DIR"\nchown mobile:mobile "$LOG_DIR"\nexit 0\n')
+    var_dir = os.path.join(pack.LAYOUT, "var", "mobile", "Library", "Logs")
+    os.makedirs(var_dir, exist_ok=True)
+    try:
+        pack.check_layout()
+        print("    [FAIL] layout/var 存在却未报错，闸门失效")
+        return 1
+    except SystemExit as e:
+        print("    正确拦截（exit %s）" % e.code)
+    finally:
+        shutil.rmtree(os.path.join(pack.LAYOUT, "var"), ignore_errors=True)
 
     # 清理测试产物（只清临时目录，绝不碰真实 layout/）
     if os.path.exists(deb):

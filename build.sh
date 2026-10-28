@@ -110,8 +110,15 @@ DL_DIR="${STAGE}/Library/MobileSubstrate/DynamicLibraries"
 mkdir -p "${DL_DIR}"
 cp -f "${OUT}/${DYLIB_NAME}.dylib" "${DL_DIR}/${DYLIB_NAME}.dylib"
 
-mkdir -p "${STAGE}/var/mobile/Library/Logs/ShortcutsLagFix"
-mkdir -p "${STAGE}/var/mobile/Library/Preferences"
+# ★ 绝对不在 layout 里放 var/ 目录。
+# dpkg 以 root 解包，这些目录会变成 root:wheel 755，而快捷指令 App 跑在
+# mobile 用户下，建不了文件 —— 结果就是「日志目录存在但一条日志都没有」。
+# /var/mobile 下的一切都由 postinst 创建并 chown 给 mobile。
+# 这里主动清掉历史残留，避免有人手工建过之后又被打进包里。
+if [ -e "${STAGE}/var" ]; then
+    echo "[build] 清理 layout/var（不得进 data.tar）..."
+    rm -rf "${STAGE}/var"
+fi
 
 # 校验过滤配置存在且含目标 bundle
 if [ ! -f "${DL_DIR}/${DYLIB_NAME}.plist" ]; then
@@ -122,8 +129,14 @@ if ! grep -q "com.apple.shortcuts" "${DL_DIR}/${DYLIB_NAME}.plist"; then
     echo "[build][FATAL] 过滤 plist 未包含 com.apple.shortcuts" >&2
     exit 1
 fi
-if [ ! -f "${STAGE}/var/mobile/Library/Preferences/com.liehuu.shortcutslagfix.plist" ]; then
-    echo "[build][FATAL] 缺少预置配置文件" >&2
+
+# postinst 负责创建日志目录并 chown 给 mobile，缺了它日志就写不出来
+if [ ! -f "${STAGE}/DEBIAN/postinst" ]; then
+    echo "[build][FATAL] 缺少 DEBIAN/postinst（负责 chown 日志目录）" >&2
+    exit 1
+fi
+if ! grep -q "Logs/ShortcutsLagFix" "${STAGE}/DEBIAN/postinst"; then
+    echo "[build][FATAL] postinst 未提及日志目录" >&2
     exit 1
 fi
 
