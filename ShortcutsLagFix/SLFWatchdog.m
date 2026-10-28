@@ -114,6 +114,16 @@ static _Atomic uint64_t gSegWallusSum = 0;
 static _Atomic uint32_t gSegRunStateMask = 0;
 // 整段观测期内 run_state 各值的出现次数，便于打印"WAITING 6 次 / RUNNING 0 次"。
 static _Atomic int gSegRunStateHist[8];
+// run_state 自身的有效采样次数。
+//
+// ★ 为什么必须单独计数（1.0.7 日志实测缺陷）：
+//   「其他」原本写成 `samples - RUNNING - WAITING - UNINTERRUPTIBLE`，
+//   但 samples 是 **CPU 增量成功计算** 的次数，而 gSegRunStateHist 是
+//   **每次 tick 都累加** —— 两个不同的基数相减，必然出负数。
+//   实测 32/33 段打印出「其他 -1」，且出现 RUNNING 2 / WAITING 1 却 samples=2
+//   这种自相矛盾（2+1=3 > 2），一眼就能看出基数是错的。
+//   凡「用 A 的总数减去 B 的分项」，必须先确认 A 与 B 是同一个基数。
+static _Atomic int gSegRunStateSamples = 0;
 
 // 前置声明：SLFWatchdogHealthCheck 定义在下方，但被上方的定时器 block 引用。
 void SLFWatchdogHealthCheck(void);
@@ -739,22 +749,48 @@ static void SLFSegmentSummaryAndReset(void) {
                 uint64_t cpuSum = atomic_load(&gSegCPUusSum);
                 uint64_t wallSum = atomic_load(&gSegWallusSum);
                 if (wallSum > 0) {
-                    SLFLogAlways(@"[stall]   本段平均 CPU 占用率 %.0f%%"
-                                  "（这一段的墙钟时间里，主线程有多少比例真的在烧 CPU）",
-                                  (double)cpuSum * 100.0 / (double)wallSum);
+                    // ★ 必须在这里把「栈是快照」讲清楚（1.0.7 日志实测教训）：
+                    //   抓栈只在检测到阻塞时触发，抓到的是主线程**被唤醒那一刻**
+                    //   正在执行的代码。而 CPU 占用率是整段的累计值。
+                    //   两者会给出看似矛盾的画面：栈顶明明在 SwiftUI 里算，
+                    //   CPU 却只有 4%。真相是主线程 95% 时间在睡，
+                    //   恰好被抓到的那几毫秒在执行 SwiftUI 代码。
+                    //   若不点破，读日志的人（包括我自己）会把「在等」误读成「在算」，
+                    //   进而去找"哪段 SwiftUI 代码慢"——那个方向从一开始就是错的。
+                    double cpuPct = (double)cpuSum * 100.0 / (double)wallSum;
+                    NSString *hint = @"";
+                    if (cpuPct < 15.0) {
+                        hint = @" ← 主线程绝大部分时间在睡/等，不是在算。"
+                                "上面的栈只是它被唤醒那一刻的切片，不能据此认为它在算这一段";
+                    } else if (cpuPct >= 50.0) {
+                        hint = @" ← 主线程真在烧 CPU，上面的栈可以直接当作耗时原因";
+                    }
+                    SLFLogAlways(@"[stall]   本段平均 CPU 占用率 %.0f%%（CPU %.1fms / 墙钟 %.1fms）%@",
+                                  cpuPct,
+                                  (double)cpuSum / 1000.0,
+                                  (double)wallSum / 1000.0,
+                                  hint);
                 }
 
                 // run_state 原始分布 —— 这是自证项，不是判据。
                 // 1.0.6 实测它 66 次全报 WAITING 而 PC 一直在变，
                 // 这一行就是为了让下一轮日志能直接确认它是否可信。
-                SLFLogAlways(@"[stall]   本段 run_state 原始值：RUNNING %d / WAITING %d / "
-                              "UNINTERRUPTIBLE %d / 其他 %d（仅作观测，不参与判定）",
-                              atomic_load(&gSegRunStateHist[TH_STATE_RUNNING]),
-                              atomic_load(&gSegRunStateHist[TH_STATE_WAITING]),
-                              atomic_load(&gSegRunStateHist[TH_STATE_UNINTERRUPTIBLE]),
-                              samples - atomic_load(&gSegRunStateHist[TH_STATE_RUNNING])
-                                      - atomic_load(&gSegRunStateHist[TH_STATE_WAITING])
-                                      - atomic_load(&gSegRunStateHist[TH_STATE_UNINTERRUPTIBLE]));
+                {
+                    // ★ 基数必须用 gSegRunStateSamples，不能用 CPU 的 samples。
+                    //   1.0.7 日志里 32/33 段打印「其他 -1」，正是用错基数的后果：
+                    //   出现了 RUNNING 2 / WAITING 1 却 samples=2 的自相矛盾。
+                    int rsRun  = atomic_load(&gSegRunStateHist[TH_STATE_RUNNING]);
+                    int rsWait = atomic_load(&gSegRunStateHist[TH_STATE_WAITING]);
+                    int rsUn   = atomic_load(&gSegRunStateHist[TH_STATE_UNINTERRUPTIBLE]);
+                    int rsAll  = atomic_load(&gSegRunStateSamples);
+                    int rsOther = rsAll - rsRun - rsWait - rsUn;
+                    // 防御：即便逻辑正确，也绝不允许把负数印出去（负数会让读日志的人
+                    // 怀疑整行数据，包括旁边那两行正确的判据）。
+                    if (rsOther < 0) rsOther = 0;
+                    SLFLogAlways(@"[stall]   本段 run_state 原始值：RUNNING %d / WAITING %d / "
+                                  "UNINTERRUPTIBLE %d / 其他 %d（共采到 %d 次，仅作观测，不参与判定）",
+                                  rsRun, rsWait, rsUn, rsOther, rsAll);
+                }
             }
             if (pcS >= 3) {
                 double sameRatio = (double)pcSame / (double)pcS;
@@ -788,6 +824,7 @@ static void SLFSegmentSummaryAndReset(void) {
     atomic_store(&gSegWallusSum, 0);
     atomic_store(&gSegRunStateMask, 0);
     for (int i = 0; i < 8; i++) atomic_store(&gSegRunStateHist[i], 0);
+    atomic_store(&gSegRunStateSamples, 0);
 }
 
 #pragma mark - 看门狗主循环
@@ -852,6 +889,10 @@ static void SLFWatchdogTick(void) {
                      atomic_load(&gSegRunStateMask) | (1u << (unsigned)runState));
         atomic_store(&gSegRunStateHist[runState],
                      atomic_load(&gSegRunStateHist[runState]) + 1);
+        // 与直方图同步累加：这两个数必须永远满足
+        // gSegRunStateSamples == 各直方图项之和，否则「其他」还会出负数。
+        atomic_store(&gSegRunStateSamples,
+                     atomic_load(&gSegRunStateSamples) + 1);
     }
 
     uint64_t cpuPrev = atomic_load(&gLastMainCPUms);

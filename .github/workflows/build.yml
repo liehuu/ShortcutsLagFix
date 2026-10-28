@@ -202,6 +202,24 @@ jobs:
           grep -q '本段平均 CPU 占用率' ShortcutsLagFix/SLFWatchdog.m             || { echo "::error::段结算缺少 CPU 占用率输出"; exit 1; }
           grep -q '本段 run_state 原始值' ShortcutsLagFix/SLFWatchdog.m             || { echo "::error::缺少 run_state 原始分布自证行"; exit 1; }
 
+          # 11b) ★ run_state 的「其他」必须用自身基数统计。
+          #     实测事故（1.0.7 日志）：写成 samples - RUNNING - WAITING - UNINTERRUPTIBLE，
+          #     但 samples 是「CPU 增量成功计算」的次数，直方图却是每次 tick 都加，
+          #     两个不同基数相减 → 32/33 段打印出「其他 -1」，
+          #     还出现 RUNNING 2 / WAITING 1 却 samples=2 的自相矛盾（2+1=3>2）。
+          grep -q 'gSegRunStateSamples' ShortcutsLagFix/SLFWatchdog.m             || { echo "::error::run_state 缺少自身采样基数 gSegRunStateSamples，「其他」会算出负数"; exit 1; }
+          # 反向守卫：绝不允许再用 CPU 的 samples 去减 run_state 的直方图。
+          if grep -q 'samples - atomic_load(&gSegRunStateHist' ShortcutsLagFix/SLFWatchdog.m; then
+            echo "::error::仍用 samples 减 run_state 直方图 —— 基数不同，必然出负数"
+            exit 1
+          fi
+
+          # 11c) ★ 栈快照偏差必须写进日志。
+          #     抓栈只在检测到阻塞时触发，抓到的是主线程被唤醒那一刻的代码；
+          #     而 CPU 是整段累计值。两者会给出「栈顶在 SwiftUI 算、CPU 只有 4%」
+          #     的矛盾画面。不点破就会让人去找"哪段 SwiftUI 代码慢"，方向从一开始就错。
+          grep -q '主线程绝大部分时间在睡/等' ShortcutsLagFix/SLFWatchdog.m             || { echo "::error::缺少栈快照偏差的判读提示（CPU 低时栈不代表耗时原因）"; exit 1; }
+
           # 12) postinst 必须预置两个新键，否则用户无法调段内抽稀。
           for k in StallResampleMS StallMaxCapturesPerSegment; do
             grep -q "$k" layout/DEBIAN/postinst               || { echo "::error::postinst 内嵌配置缺 $k"; exit 1; }
