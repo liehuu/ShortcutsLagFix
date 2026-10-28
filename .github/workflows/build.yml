@@ -104,9 +104,15 @@ jobs:
           #    实测事故：SLFCommon.h 曾把版本写死成 "1.0.0"，之后 control 依次
           #    升到 1.0.1/1.0.2/1.0.3，而三次交付的 dylib 全都自报 v1.0.0，
           #    害我误以为用户装的是旧包。这条守卫防止它被写回去。
-          if grep -nE '^[[:space:]]*#define[[:space:]]+SLF_VERSION[[:space:]]+"[0-9]' \
-               ShortcutsLagFix/SLFCommon.h; then
+          #
+          #    注意排除 0.0.0-unknown：那是 #ifndef 的兜底值，本来就该留在
+          #    源码里（构建脚本漏注入时要靠它把问题暴露出来）。
+          #    第一版守卫漏了这个排除，结果自己把合法兜底判成违规，白失败一轮。
+          hardcoded="$(grep -nE '^[[:space:]]*#define[[:space:]]+SLF_VERSION[[:space:]]+"[0-9]' \
+                         ShortcutsLagFix/SLFCommon.h | grep -v 'unknown' || true)"
+          if [ -n "$hardcoded" ]; then
             echo "::error::SLFCommon.h 又把版本号写死了；版本必须由 build.sh 从 control 注入"
+            echo "命中行：$hardcoded"
             exit 1
           fi
 
