@@ -1,0 +1,10 @@
+* text=auto eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+*.m text eol=lf
+*.h text eol=lf
+*.plist text eol=lf
+control text eol=lf
+Makefile text eol=lf
+*.yml text eol=lf
+*.md text eol=lf
