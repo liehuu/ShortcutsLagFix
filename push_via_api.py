@@ -168,10 +168,16 @@ def main():
     })
     print("main 已前移到 %s" % new_commit["sha"][:8])
 
-    # 6. 本地也把这次改动落成一个真实提交，并同步远端引用，
-    #    这样以后 git log / git diff 不会失真。
-    sh(["git", "update-ref", "refs/remotes/origin/main", new_commit["sha"]])
-    print("\n完成。")
+    # 6. 同步本地远端引用。注意：API 推送在远端生成的是新对象，本地没有，
+    #    update-ref 会以 "nonexistent object" 拒绝。这不影响推送结果
+    #    （差异计算基于 tree 比对，不依赖该引用），所以这里只提示、不报错。
+    try:
+        sh(["git", "update-ref", "refs/remotes/origin/main", new_commit["sha"]])
+        print("\n本地 origin/main 已同步")
+    except RuntimeError:
+        print("\n本地缺少该 commit 对象，origin/main 引用未更新"
+              "（正常现象，差异计算不依赖它）")
+    print("完成。")
     return 0
 
 
