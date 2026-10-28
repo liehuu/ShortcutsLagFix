@@ -110,14 +110,16 @@ static uint64_t SLFWarmLanguage(void) {
     uint64_t t0 = SLFNowNS();
     @try {
         NSString *sample = @"新建 快捷指令 shortcut";
-        // 注意 block 签名：NLTokenizer 的 enumerateTokensInRange:usingBlock:
-        // 回调是 (NSRange, NLTokenizer *, BOOL *)，三个参数。
-        // 只写 (NSRange, BOOL *) 会直接编译失败 —— 这是本人第一版写错的地方。
+        // block 签名以 SDK 头文件为准（NLTokenizer.h:57）：
+        //   (NSRange tokenRange, NLTokenizerAttributes flags, BOOL *stop)
+        // 第二参是选项位，不是 NLTokenizer 对象 —— 我凭记忆先写成了
+        // (NSRange, NLTokenizer *, BOOL *)，CI 编译器直接报不兼容。
+        // 教训：涉及第三方/系统 API 的签名，一律以头文件为准，不凭印象。
         NLTokenizer *tok = [[NLTokenizer alloc] initWithUnit:NLTokenUnitWord];
         tok.string = sample;
         [tok enumerateTokensInRange:NSMakeRange(0, sample.length)
-                         usingBlock:^(NSRange r, NLTokenizer *t, BOOL *stop) {
-                             (void)r; (void)t; (void)stop;
+                         usingBlock:^(NSRange r, NLTokenizerAttributes flags, BOOL *stop) {
+                             (void)r; (void)flags; (void)stop;
                          }];
 
         // 日文分词走 mecab，与日志里 libmecab 的调用链对应；
@@ -125,8 +127,8 @@ static uint64_t SLFWarmLanguage(void) {
         NLTokenizer *tokJa = [[NLTokenizer alloc] initWithUnit:NLTokenUnitWord];
         tokJa.string = @"ショートカット";
         [tokJa enumerateTokensInRange:NSMakeRange(0, tokJa.string.length)
-                           usingBlock:^(NSRange r, NLTokenizer *t, BOOL *stop) {
-                               (void)r; (void)t; (void)stop;
+                           usingBlock:^(NSRange r, NLTokenizerAttributes flags, BOOL *stop) {
+                               (void)r; (void)flags; (void)stop;
                            }];
 
         if (@available(iOS 13.0, *)) {
