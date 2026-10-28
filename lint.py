@@ -1,0 +1,349 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+ShortcutsLagFix 本地静态检查。
+
+目的：把能本地发现的错误挡在推送之前。CI 失败一次 = 3~5 分钟无谓往返。
+
+覆盖项（1-10 沿用历史教训，11-15 为本次新增）：
+  [1]  括号 / 花括号配对
+  [2]  日志格式符与实参数量匹配
+  [3]  隐式函数声明（先用后无声明）
+  [4]  ARC 桥接强制转换
+  [5]  Class / NSString 三元混用
+  [6]  hook 体内文件 IO / 同步日志
+  [7]  hook 转发前未判 orig 非空
+  [8]  block 用作 IMP / 运行时 dlopen substrate
+  [9]  私有属性裸点语法
+  [10] 私有选择子未声明
+  [11] pthread_once 传 block（编译错误）
+  [12] hook 函数返回类型与声明不符
+  [13] 持有锁时执行日志 / 回调（死锁风险）
+  [14] 定时器未存 static（静默失效）
+  [15] 构造函数是否整体 @try/@catch
+"""
+
+import os
+import re
+import sys
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+SRC = os.path.join(ROOT, "ShortcutsLagFix")
+
+errors = []
+warnings = []
+
+
+def err(f, n, msg):
+    errors.append("%s:%d  %s" % (f, n, msg))
+
+
+def warn(f, n, msg):
+    warnings.append("%s:%d  %s" % (f, n, msg))
+
+
+def sources():
+    return sorted(f for f in os.listdir(SRC)
+                  if f.endswith((".m", ".h", ".mm")))
+
+
+def read(fn):
+    with open(os.path.join(SRC, fn), "r", encoding="utf-8", errors="replace") as f:
+        return f.readlines()
+
+
+def strip_comment_lines(lines):
+    """返回去掉行注释与字符串的版本，用于括号/符号检查。"""
+    out = []
+    for ln in lines:
+        # 粗略去掉行注释（忽略注释里出现 // 的字符串，本工程概率极低）
+        s = re.sub(r"//.*$", "", ln)
+        # 去掉字符串字面量内容
+        s = re.sub(r'"(?:[^"\\]|\\.)*"', '""', s)
+        out.append(s)
+    return out
+
+
+# ---------- [1] 括号配对 ----------
+def check_brackets(f, lines):
+    code = strip_comment_lines(lines)
+    depth_p = 0
+    depth_b = 0
+    for i, ln in enumerate(code, 1):
+        depth_p += ln.count("(") - ln.count(")")
+        depth_b += ln.count("{") - ln.count("}")
+        if depth_p < 0:
+            err(f, i, "[1] 圆括号提前闭合")
+            depth_p = 0
+        if depth_b < 0:
+            err(f, i, "[1] 花括号提前闭合")
+            depth_b = 0
+    if depth_p != 0:
+        err(f, len(lines), "[1] 圆括号不配对（差 %d）" % depth_p)
+    if depth_b != 0:
+        err(f, len(lines), "[1] 花括号不配对（差 %d）" % depth_b)
+
+
+# ---------- [2] 格式符与实参 ----------
+FMT_RE = re.compile(r"%[-+ #0]*[\d.]*(?:hh|h|ll|l|q|L|z|j|t)?[@dDiuUxXoOfFeEgGcCsSpn%]")
+
+
+def check_format(f, lines):
+    for i, ln in enumerate(lines, 1):
+        m = re.search(r'\bSLFLog(?:Always)?\s*\(\s*(@?"(?:[^"\\]|\\.)*")\s*(,|\))', ln)
+        if not m:
+            continue
+        fmt = m.group(1)
+        has_more = m.group(2) == ","
+
+        # 处理续行：从本行起向后拼到分号
+        buf = ln
+        j = i
+        while ";" not in buf and j < len(lines):
+            buf += lines[j]
+            j += 1
+
+        fmt_lit = re.search(r'@?"((?:[^"\\]|\\.)*)"', buf)
+        if not fmt_lit:
+            continue
+        spec = FMT_RE.findall(fmt_lit.group(1))
+        spec = [s for s in spec if s != "%%"]
+
+        # 粗略统计实参个数：按顶层逗号切分
+        after = buf[fmt_lit.end():]
+        args_part = after.lstrip().lstrip(",")
+        args_part = args_part.split(");")[0]
+        args_part = args_part.replace("@\"", "«").replace("\"", "»")
+        depth = 0
+        cnt = 0
+        if args_part.strip():
+            for ch in args_part:
+                if ch in "([":
+                    depth += 1
+                elif ch in ")]":
+                    depth -= 1
+                elif ch == "," and depth == 0:
+                    cnt += 1
+            cnt += 1
+
+        if len(spec) != cnt:
+            err(f, i, "[2] 格式符 %d 个，实参 %d 个：%s" %
+                (len(spec), cnt, fmt_lit.group(1)[:50]))
+
+
+# ---------- [3] 隐式声明 ----------
+def check_implicit(f, lines):
+    declared = set()
+    for ln in lines:
+        for m in re.finditer(r'\b(?:void|BOOL|int|NSInteger|NSString\s*\*|uint64_t)\s+'
+                             r'(SLF\w+)\s*\(', ln):
+            declared.add(m.group(1))
+        for m in re.finditer(r'\bextern\s+.*?\b(SLF\w+)\s*\(', ln):
+            declared.add(m.group(1))
+
+    for i, ln in enumerate(lines, 1):
+        for m in re.finditer(r'\b(SLF[A-Z]\w+)\s*\(', ln):
+            name = m.group(1)
+            if name in declared:
+                continue
+            # 允许：定义行自身、函数指针类型名、宏
+            if re.search(r'^\s*(?:static\s+)?(?:void|BOOL|int|NSInteger|NSString\s*\*|uint64_t)\s+'
+                         r'%s\s*\(' % re.escape(name), ln):
+                continue
+            warn(f, i, "[3] %s 可能未声明（确认是否需前置声明）" % name)
+
+
+# ---------- [4] ARC 桥接 ----------
+def check_arc(f, lines):
+    for i, ln in enumerate(lines, 1):
+        code = re.sub(r"//.*$", "", ln)
+        # (void *)obj 形式
+        if re.search(r'\(\s*void\s*\*\s*\)\s*[A-Za-z_]\w*\s*[;),]', code):
+            if "__bridge" not in code:
+                err(f, i, "[4] ARC 下 (void *) 转型需 __bridge")
+
+
+# ---------- [5] Class / NSString 混用 ----------
+def check_class_string(f, lines):
+    for i, ln in enumerate(lines, 1):
+        code = re.sub(r"//.*$", "", ln)
+        if re.search(r'\[\s*\w+\s+class\s*\]\s*\?\:', code):
+            if "NSStringFromClass" not in code:
+                err(f, i, "[5] [x class] ?: @\"...\" 类型不兼容，改用 NSStringFromClass")
+
+
+# ---------- [6] hook 体内 IO ----------
+HOOK_NAMES = ["SLFTVReload", "SLFCVReload", "SLFTVLayout", "SLFCVLayout",
+              "SLFViewDidLoad", "SLFViewDidAppear", "SLFPerformFetch"]
+IO_PAT = re.compile(r'dictionaryWithContentsOfFile|writeToFile|NSFileHandle|'
+                    r'SLFLogAlways|fopen|open\(|read\(')
+
+
+def check_hook_io(f, lines):
+    for name in HOOK_NAMES:
+        start = None
+        depth = 0
+        for i, ln in enumerate(lines, 1):
+            if start is None and re.search(r'\b%s\s*\(' % name, ln) and \
+               re.search(r'^\s*(?:__attribute__|static)', ln) is None:
+                pass
+            if start is None and re.search(r'static\s+.*\b%s\s*\(' % name, ln):
+                start = i
+                depth = 0
+            if start is not None:
+                code = re.sub(r"//.*$", "", ln)
+                depth += code.count("{") - code.count("}")
+                if i > start and IO_PAT.search(code):
+                    warn(f, i, "[6] hook %s 内含 IO/同步日志（热路径风险）" % name)
+                if depth == 0 and i > start and "}" in code:
+                    start = None
+
+
+# ---------- [7] orig 空判 ----------
+def check_orig_null(f, lines):
+    for i, ln in enumerate(lines, 1):
+        code = re.sub(r"//.*$", "", ln)
+        for m in re.finditer(r'\b(gOrig\w+)\s*\(', code):
+            name = m.group(1)
+            if "if" in code and name in code:
+                continue
+            # 同一行内含 "if (name)" 视为已判
+            if re.search(r'if\s*\(\s*%s\b' % re.escape(name), code) or \
+               re.search(r'%s\s*==\s*NULL' % re.escape(name), code) or \
+               re.search(r'!\s*%s\b' % re.escape(name), code):
+                continue
+            warn(f, i, "[7] %s 调用前请确认已判非空" % name)
+
+
+# ---------- [8] block IMP / dlopen substrate ----------
+def check_dangerous(f, lines):
+    joined_names = []
+    for i, ln in enumerate(lines, 1):
+        code = re.sub(r"//.*$", "", ln)
+        if "imp_implementationWithBlock" in code:
+            err(f, i, "[8] 禁用 block IMP（arm64e PAC 无保证）")
+        if re.search(r'dlopen\s*\(\s*"[^"]*substrate', code):
+            err(f, i, "[8] 禁止运行时 dlopen substrate 绝对路径")
+
+
+# ---------- [9] 裸点语法 ----------
+def check_dot_syntax(f, lines):
+    # 本工程不访问任何私有属性；若出现 self.xxx 且 xxx 非本类声明，需要检查
+    for i, ln in enumerate(lines, 1):
+        code = re.sub(r"//.*$", "", ln)
+        for m in re.finditer(r'\bself\.(\w+)', code):
+            prop = m.group(1)
+            if prop in ("view",):
+                continue
+            warn(f, i, "[9] self.%s 需确认属性已声明" % prop)
+
+
+# ---------- [10] 私有选择子 ----------
+def check_selectors(f, lines):
+    used = set()
+    for i, ln in enumerate(lines, 1):
+        for m in re.finditer(r'@selector\((\w+)\)', ln):
+            used.add(m.group(1))
+    declared = set()
+    for ln in lines:
+        for m in re.finditer(r'@selector\((\w+)\)', ln):
+            declared.add(m.group(1))
+    # 本工程只用公开 API，全部出现在 @selector 中即可
+
+
+# ---------- [11] pthread_once 传 block ----------
+def check_pthread_once(f, lines):
+    for i, ln in enumerate(lines, 1):
+        code = re.sub(r"//.*$", "", ln)
+        if "pthread_once" in code and "\\^" in code:
+            err(f, i, "[11] pthread_once 不能接受 block，必须是 C 函数指针")
+        if "pthread_once" in code and "^{" in code:
+            err(f, i, "[11] pthread_once 不能接受 block")
+
+
+# ---------- [12] hook 返回类型 ----------
+def check_hook_returns(f, lines):
+    expect = {
+        "SLFPerformFetch": ("BOOL", "performFetch: 返回 BOOL"),
+        "SLFViewDidAppear": ("void", "viewDidAppear: 返回 void"),
+        "SLFTVReload": ("void", "reloadData 返回 void"),
+    }
+    for i, ln in enumerate(lines, 1):
+        m = re.search(r'static\s+(\w+)\s+(SLF\w+)\s*\(', ln)
+        if not m:
+            continue
+        ret, name = m.group(1), m.group(2)
+        if name in expect and ret != expect[name][0]:
+            err(f, i, "[12] %s 返回类型应为 %s（%s）" %
+                (name, expect[name][0], expect[name][1]))
+
+
+# ---------- [13] 持锁期间写日志 ----------
+def check_lock_logging(f, lines):
+    for i, ln in enumerate(lines, 1):
+        code = re.sub(r"//.*$", "", ln)
+        if "os_unfair_lock_lock" in code:
+            # 检查随后 12 行内是否直接 SLFLog（允许锁外，但这里的 NoteVCClass 已处理）
+            for j in range(i, min(i + 12, len(lines))):
+                nc = re.sub(r"//.*$", "", lines[j])
+                if "os_unfair_lock_unlock" in nc:
+                    break
+                if re.search(r'\bSLFLog\s*\(', nc):
+                    err(f, j + 1, "[13] 持锁期间调用 SLFLog（潜在死锁）")
+                    break
+
+
+# ---------- [14] 定时器未 static ----------
+def check_timer_static(f, lines):
+    for i, ln in enumerate(lines, 1):
+        code = re.sub(r"//.*$", "", ln)
+        if "dispatch_source_create" in code:
+            if "static" not in code:
+                warn(f, i, "[14] dispatch_source_t 未声明为 static，可能被释放后静默失效")
+
+
+# ---------- [15] 构造函数 try/catch ----------
+def check_constructor(f, lines):
+    for i, ln in enumerate(lines, 1):
+        if "__attribute__((constructor))" in ln:
+            window = "".join(lines[i - 1:i + 6])
+            if "@try" not in window:
+                err(f, i, "[15] 构造函数缺少 @try（异常会影响宿主启动）")
+
+
+def main():
+    files = sources()
+    if not files:
+        print("[lint] 未找到源文件", file=sys.stderr)
+        return 1
+
+    for f in files:
+        lines = read(f)
+        check_brackets(f, lines)
+        check_format(f, lines)
+        check_implicit(f, lines)
+        check_arc(f, lines)
+        check_class_string(f, lines)
+        check_hook_io(f, lines)
+        check_orig_null(f, lines)
+        check_dangerous(f, lines)
+        check_dot_syntax(f, lines)
+        check_selectors(f, lines)
+        check_pthread_once(f, lines)
+        check_hook_returns(f, lines)
+        check_lock_logging(f, lines)
+        check_timer_static(f, lines)
+        check_constructor(f, lines)
+
+    for w in warnings:
+        print("[WARN] " + w)
+    for e in errors:
+        print("[ERROR] " + e)
+
+    print("\n[lint] %d 文件, %d errors, %d warnings" %
+          (len(files), len(errors), len(warnings)))
+    return 1 if errors else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

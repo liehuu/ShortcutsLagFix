@@ -1,0 +1,8 @@
+{
+	Filter = {
+		Bundles = (
+			"com.apple.shortcuts",
+			"is.workflow.my.app"
+		);
+	};
+}

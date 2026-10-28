@@ -1,0 +1,100 @@
+name: Build deb
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    # 必须用 macOS runner：需要 iphoneos SDK 与 xcrun（lipo / codesign / clang）。
+    # 不用 Ubuntu + Theos 的原因：Theos 要 clone 整个仓库再下 SDK，
+    # 在这台脆弱链路上多一个失败点，而本项目不需要 Theos 的打包能力
+    # （deb 由 pack.py 手工构造，格式完全可控）。
+    runs-on: macos-14
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 环境自检
+        run: |
+          echo "== xcode =="
+          xcodebuild -version || true
+          echo "== SDK =="
+          xcrun --sdk iphoneos --show-sdk-path
+          xcrun --sdk iphoneos --show-sdk-version
+          echo "== clang =="
+          xcrun --sdk iphoneos -f clang
+          echo "== python =="
+          python3 --version
+
+      - name: 静态检查（本地 10+5 项）
+        run: |
+          python3 lint.py || {
+            echo "::error::静态检查未通过，禁止继续构建"
+            exit 1
+          }
+
+      - name: 编译（arm64 + arm64e 双切片）
+        run: |
+          chmod +x build.sh
+          ./build.sh
+
+      - name: 产物自证（架构 / 签名 / install_name）
+        run: |
+          echo "===== lipo -info ====="
+          lipo -info build/ShortcutsLagFix.dylib
+
+          echo "===== 逐架构 cputype/subtype ====="
+          lipo -detailed_info build/ShortcutsLagFix.dylib | grep -E "architecture|align" || true
+
+          echo "===== codesign ====="
+          codesign -dv build/ShortcutsLagFix.dylib 2>&1 | head -8 || true
+
+          echo "===== install_name ====="
+          otool -D build/ShortcutsLagFix.dylib || true
+
+          echo "===== 导出符号（应只有构造函数与少量入口）====="
+          nm -gU build/ShortcutsLagFix.dylib | head -20 || true
+
+          echo "===== 硬闸门：必须双切片 ====="
+          INFO="$(lipo -info build/ShortcutsLagFix.dylib)"
+          echo "$INFO"
+          echo "$INFO" | grep -q arm64e || { echo "::error::缺少 arm64e 切片，在用户 arm64e 设备上会静默失效"; exit 1; }
+          echo "$INFO" | grep -q arm64  || { echo "::error::缺少 arm64 切片"; exit 1; }
+
+      - name: 打包 deb
+        run: |
+          python3 pack.py
+
+      - name: 上传 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ShortcutsLagFix-deb
+          path: debs/*.deb
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 上传 dylib（便于对照排查）
+        uses: actions/upload-artifact@v4
+        with:
+          name: ShortcutsLagFix-dylib
+          path: build/ShortcutsLagFix.dylib
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: 汇总信息
+        if: always()
+        run: |
+          echo "### 构建结果" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f build/ShortcutsLagFix.dylib ]; then
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            lipo -info build/ShortcutsLagFix.dylib >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+          ls -lh debs/ 2>/dev/null >> $GITHUB_STEP_SUMMARY || true
