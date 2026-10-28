@@ -51,7 +51,7 @@ def main():
     # "未声明的函数"，于是一堆假错误把所有真问题淹没。
     # 实测：这里原先没有 "const char"，SLFImageNameAndOffset 因此被误报 3 次。
     ret_types = (r"void|BOOL|NSInteger|uint64_t|NSString|IMP|dispatch_source_t"
-                 r"|const\s+char")
+                 r"|dispatch_queue_t|const\s+char")
     for f in sorted(glob.glob(os.path.join(SRC, "*.m"))):
         body = strip_comments(open(f, encoding="utf-8").read())
         for m in re.finditer(

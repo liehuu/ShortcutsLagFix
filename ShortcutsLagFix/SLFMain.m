@@ -48,8 +48,13 @@ static void SLFMainThreadSetup(void) {
         SLFLogAlways(@"提示：新建一个快捷指令，然后查看本日志。");
         SLFLogAlways(@"      [stall] 行 = 卡顿现场。已自动标注「类型」与「本段」；");
         SLFLogAlways(@"                  同一段持续阻塞会多次上报，切勿把毫秒数累加，");
-        SLFLogAlways(@"                  该段真实总长见紧随其后的「上一段结束」行。");
-        SLFLogAlways(@"      [warmup] 行 = 已提前做掉的一次性初始化，不会再算到点击上。");
+        SLFLogAlways(@"                  段真实总长见紧随其后的「上一段结束」行。");
+        SLFLogAlways(@"                  「上一段结束」行还会报「本行落盘滞后 X 秒」——");
+        SLFLogAlways(@"                  滞后大说明看门狗自己被打断过，那段时间是观测盲区。");
+        SLFLogAlways(@"                  栈帧格式为「镜像名 0x偏移」，偏移相对该镜像基址，");
+        SLFLogAlways(@"                  可直接 atos 符号化；near 后面只是最近导出符号，仅作参考。");
+        SLFLogAlways(@"      [warmup] 行 = 预热埋点。v1.0.5 起预热默认关闭（WarmupEnabled=NO），");
+        SLFLogAlways(@"                  因为实测它反而与主线程争 CoreNLP 锁。");
         SLFLogAlways(@"      [slow] 行 = 单个方法耗时超阈值（仅覆盖未覆写该方法的子类）。");
     } @catch (__unused NSException *e) {
         SLFLogAlways(@"主线程初始化异常: %@", e);

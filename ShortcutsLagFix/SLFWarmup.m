@@ -4,33 +4,39 @@
 //
 //  把「子系统首次触达」的成本从用户可感知的路径上挪走。
 //
-//  依据全部来自用户 v1.0.0 的实测日志（33 次 stall，主线程真实不可用 16.65 秒），
-//  其中以下四段是**一次性初始化**，第二次调用几乎零开销：
+//  ═══════════════════════════════════════════════════════════════════
+//  重要：本模块默认关闭（v1.0.5 起）。
 //
-//    #25  298ms  CTFontCreateWithFontDescriptor
-//                ← CoreFoundation bsearch → CoreText → UIFoundation → WorkflowUI
-//    #28  602ms  CFBurstTrieCreateFromFile
-//                ← stat → CoreFoundation，拼写/语言词典的 trie 从磁盘载入
-//    #13  285ms  libmecab ×4 + CoreNLP ×2
-//                ← UIFoundation ×9 → SwiftUI ×20 → WorkflowUICore
-//    #10 3134ms  ImageIO inflate + _platform_memmove（仅其中库加载部分可预热）
+//  为什么关掉：v1.0.4 默认开启，用户实测日志提供了反证 ——
 //
-//  这四处合计约 1.2 秒是**可以完全移出主线程**的（#10 只能省掉库初始化那一小段，
-//  真正的解压开销属于 App 自身行为，改不动，见 README 的诚实边界章节）。
+//    13:27:36.221  [warmup] 词典 trie 1779.3ms
+//    13:27:39.940  主线程开始阻塞（第 1~23 次上报，合并为一段 4.05s）
+//                  栈：AutoFillUI → CFStringTokenizerCreate
+//                      → CoreNLP → langid_consume_string
+//    13:27:57.929  [warmup] 语言分析/mecab 21623.8ms   ← 21.6 秒！
+//
+//  主线程卡的那 4 秒，栈顶正是 CoreNLP + liblangid；
+//  而我的预热当时正在另一个线程跑 NLTokenizer / NLTagger，也是 CoreNLP + liblangid。
+//  两者共用同一套全局分析器状态（首次初始化时持锁），
+//  于是「我以为在帮它预热」实际变成了「我在跟它抢，把它拖住」。
+//
+//  这条教训比功能重要：
+//    预热的安全性不能靠"我在后台线程"来论证。
+//    只要它触碰的是同一份全局状态，就可能在主线程最需要的时候把它锁住。
+//  所以：语言分析预热整段删除；其余各项降级为 opt-in，并加硬超时。
+//  ═══════════════════════════════════════════════════════════════════
 //
 //  设计约束（比功能更重要）：
-//   1. 只在线程外做、只在 BACKGROUND QoS 做 —— 任何时候都不与主线程抢 CPU；
-//   2. 每步之前先问主线程是否响应正常，卡顿期间主动退让，绝不叠加负载；
-//   3. 全部 @try/@catch，单步失败只影响该步；
-//   4. 每一步都记耗时并落盘，这样"预热有没有真的生效"可以事后核对，
-//      而不是只相信代码看起来对。
+//   1. 默认不跑。用户必须显式 WarmupEnabled=YES 才启用；
+//   2. 每一步都有硬超时，超时立刻放弃剩余步骤 —— 绝不出现"一个步骤跑 21 秒"；
+//   3. 每步之前先问主线程是否响应正常，卡顿期间主动退让；
+//   4. 每一步都记耗时并落盘，这样"预热有没有真的生效"可以事后核对。
 //
 
 #import "SLFCommon.h"
 #import <UIKit/UIKit.h>
 #import <CoreText/CoreText.h>
 #import <ImageIO/ImageIO.h>
-#import <NaturalLanguage/NaturalLanguage.h>
 #import <pthread.h>
 #import <unistd.h>
 
@@ -66,6 +72,7 @@ static void SLFWarmupBePolite(void) {
 // 1) CoreText 字体栈。
 //    对应日志 #25：CTFontCreateWithFontDescriptor 里 CoreFoundation 的 bsearch
 //    在字体表里线性/二分查找，首次还要载入字体缓存。
+//    实测耗时 7.3ms —— 唯一一个真正又快又安全的预热项。
 static uint64_t SLFWarmFonts(void) {
     uint64_t t0 = SLFNowNS();
     @try {
@@ -88,6 +95,10 @@ static uint64_t SLFWarmFonts(void) {
 // 2) 拼写 / 语言词典 trie。
 //    对应日志 #28：CFBurstTrieCreateFromFile 602ms，栈里紧跟 stat。
 //    UITextChecker 是公开 API，初始化时会加载同一套词典。
+//
+//    ⚠ 实测 1779ms（预期 298ms），且与主线程的
+//      UIKeyboardCheckSpellingPossibleForInputMode 属同一子系统。
+//      保留但默认不启用；如需开启请留足超时。
 static uint64_t SLFWarmTextChecker(void) {
     uint64_t t0 = SLFNowNS();
     @try {
@@ -103,54 +114,12 @@ static uint64_t SLFWarmTextChecker(void) {
     return SLFNowNS() - t0;
 }
 
-// 3) 语言分析（分词）。
-//    对应日志 #13：libmecab ×4 + CoreNLP ×2，由 UIFoundation 的断行逻辑触发。
-//    NLTagger / NLTokenizer 走同一套底层分析器。
-static uint64_t SLFWarmLanguage(void) {
-    uint64_t t0 = SLFNowNS();
-    @try {
-        NSString *sample = @"新建 快捷指令 shortcut";
-        // block 签名以 SDK 头文件为准（NLTokenizer.h:57）：
-        //   (NSRange tokenRange, NLTokenizerAttributes flags, BOOL *stop)
-        // 第二参是选项位，不是 NLTokenizer 对象 —— 我凭记忆先写成了
-        // (NSRange, NLTokenizer *, BOOL *)，CI 编译器直接报不兼容。
-        // 教训：涉及第三方/系统 API 的签名，一律以头文件为准，不凭印象。
-        NLTokenizer *tok = [[NLTokenizer alloc] initWithUnit:NLTokenUnitWord];
-        tok.string = sample;
-        [tok enumerateTokensInRange:NSMakeRange(0, sample.length)
-                         usingBlock:^(NSRange r, NLTokenizerAttributes flags, BOOL *stop) {
-                             (void)r; (void)flags; (void)stop;
-                         }];
-
-        // 日文分词走 mecab，与日志里 libmecab 的调用链对应；
-        // 单独喂一段日文，确保 mecab 而非仅英文分析器被初始化。
-        NLTokenizer *tokJa = [[NLTokenizer alloc] initWithUnit:NLTokenUnitWord];
-        tokJa.string = @"ショートカット";
-        [tokJa enumerateTokensInRange:NSMakeRange(0, tokJa.string.length)
-                           usingBlock:^(NSRange r, NLTokenizerAttributes flags, BOOL *stop) {
-                               (void)r; (void)flags; (void)stop;
-                           }];
-
-        if (@available(iOS 13.0, *)) {
-            NLTagger *tagger = [[NLTagger alloc] initWithTagSchemes:@[ NLTagSchemeLanguage ]];
-            tagger.string = sample;
-            [tagger enumerateTagsInRange:NSMakeRange(0, sample.length)
-                                  unit:NLTokenUnitWord
-                                scheme:NLTagSchemeLanguage
-                               options:NLTaggerOmitPunctuation | NLTaggerOmitWhitespace
-                            usingBlock:^(NLTag tag, NSRange tokenRange, BOOL *stop) {
-                                (void)tag; (void)tokenRange; (void)stop;
-                            }];
-        }
-    } @catch (__unused NSException *e) {}
-    return SLFNowNS() - t0;
-}
-
-// 4) ImageIO / libz 解码路径。
+// 3) ImageIO / libz 解码路径。
 //    对应日志 #10 的栈：
 //      _platform_memmove → libz inflate → ImageIO ×12 → dispatch_apply →
 //      CGDataProviderCopyData → WorkflowUIServices
 //    必须真的把位图画出来才会走到 inflate，只 CreateImage 是懒解码、不触发。
+//    实测 28.3ms，安全。
 static uint64_t SLFWarmImageIO(void) {
     uint64_t t0 = SLFNowNS();
     @try {
@@ -184,39 +153,91 @@ static uint64_t SLFWarmImageIO(void) {
     return SLFNowNS() - t0;
 }
 
+#pragma mark - 带硬超时的执行器
+
+// 返回 UINT64_MAX 表示超时放弃。
+//
+// ★ 为什么必须把步骤扔到另一个队列再等：
+//   如果直接在当前线程调用，一旦该步骤内部卡住（v1.0.4 的语言分析就卡了 21.6 秒），
+//   外层没有任何手段中止它，整条预热链只能陪着一起卡。
+//   包一层 semaphore 之后，超时至少能让后续步骤不被拖累。
+//
+//   注意：超时**不能杀死**已经在跑的步骤（没有安全的线程终止手段）。
+//   所以超时后的正确做法是「记录并放弃剩余步骤」，而不是「重试」或「继续下一步」——
+//   否则会同时叠起多个长任务，反而更糟。
+static uint64_t SLFRunStepWithTimeout(uint64_t (*fn)(void), NSInteger timeoutMS) {
+    if (timeoutMS <= 0) timeoutMS = 2000;
+
+    __block uint64_t cost = 0;
+    __block BOOL finished = NO;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+
+    // 用 UTILITY 而不是 BACKGROUND：background 在 iOS 上会被显著节流，
+    // v1.0.4 的 21.6 秒里很可能有一部分就是这种节流放大出来的。
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        @try {
+            cost = fn();
+        } @catch (__unused NSException *e) {
+            cost = 0;
+        }
+        finished = YES;
+        dispatch_semaphore_signal(sem);
+    });
+
+    long r = dispatch_semaphore_wait(sem,
+        dispatch_time(DISPATCH_TIME_NOW, (int64_t)timeoutMS * NSEC_PER_MSEC));
+    if (r != 0 || !finished) return UINT64_MAX;
+    return cost;
+}
+
 #pragma mark - 调度
 
 static void SLFWarmupRun(void) {
     @autoreleasepool {
-        SLFLogAlways(@"[warmup] 开始（后台 QoS=background，不占主线程）");
+        BOOL withLanguage = SLFBool(@"WarmupLanguage", NO);
+        NSInteger stepTimeout = SLFInt(@"WarmupStepTimeoutMS", 2000);
+
+        SLFLogAlways(@"[warmup] 开始，单步硬超时 %ldms（注意：本模块默认关闭，"
+                      "开启与否请以实测 A/B 为准）", (long)stepTimeout);
         uint64_t all0 = SLFNowNS();
 
         struct { const char *name; uint64_t (*fn)(void); } steps[] = {
             { "CoreText 字体",   SLFWarmFonts },
             { "词典 trie",       SLFWarmTextChecker },
-            { "语言分析/mecab",  SLFWarmLanguage },
             { "ImageIO/libz",    SLFWarmImageIO },
         };
+        (void)withLanguage;   // 语言分析预热已整段移除，此键仅保留以兼容旧配置
 
+        BOOL aborted = NO;
         for (size_t i = 0; i < sizeof(steps) / sizeof(steps[0]); i++) {
             // 每步之前都看主线程是否空闲过；不空闲就等，绝不叠加。
             SLFWarmupBePolite();
 
-            uint64_t cost = steps[i].fn();
-            // 用 %@ 而不是 %s：SLFLog 的格式走 NSString 规则，直接给 NSString 最稳。
-            SLFLogAlways(@"[warmup] %@ %.1fms",
-                         [NSString stringWithUTF8String:steps[i].name],
-                         (double)cost / 1e6);
+            uint64_t cost = SLFRunStepWithTimeout(steps[i].fn, stepTimeout);
+            NSString *name = [NSString stringWithUTF8String:steps[i].name];
+
+            if (cost == UINT64_MAX) {
+                SLFLogAlways(@"[warmup] %@ 超过 %ldms 未返回，放弃剩余步骤。"
+                              "该步仍在后台跑完，但不再叠加后续负载。",
+                              name, (long)stepTimeout);
+                aborted = YES;
+                break;
+            }
+            SLFLogAlways(@"[warmup] %@ %.1fms", name, (double)cost / 1e6);
 
             // 步间让出 CPU。总预热只做一次，没必要抢时间。
             usleep(80 * 1000);
         }
 
         uint64_t total = SLFNowNS() - all0;
-        SLFLogAlways(@"[warmup] 完成，共 %.1fms。这些成本已从用户点击路径移出；"
-                      "若后续 [stall] 仍出现 CTFont/CFBurstTrie/mecab/ImageIO，"
-                      "说明该处不是一次性的，或预热未覆盖到那条分支。",
-                     (double)total / 1e6);
+        if (aborted) {
+            SLFLogAlways(@"[warmup] 提前结束，共 %.1fms", (double)total / 1e6);
+        } else {
+            SLFLogAlways(@"[warmup] 完成，共 %.1fms。这些成本已从用户点击路径移出；"
+                          "若后续 [stall] 仍出现 CTFont/CFBurstTrie/ImageIO，"
+                          "说明该处不是一次性的，或预热未覆盖到那条分支。",
+                          (double)total / 1e6);
+        }
     }
 }
 
@@ -228,8 +249,12 @@ void SLFWarmupStart(void) {
     bool expected = false;
     if (!atomic_compare_exchange_strong(&started, &expected, true)) return;
 
-    if (!SLFBool(@"WarmupEnabled", YES)) {
-        SLFLogAlways(@"[warmup] 已按配置禁用");
+    // ★ v1.0.5：默认关闭。
+    //   1.0.4 默认 YES，结果用户日志显示它是「词典 trie 1779ms + 语言分析 21624ms」，
+    //   后者与主线程争 CoreNLP/liblangid 锁，把主线程拖了 4 秒。
+    //   在拿到开启/关闭的 A/B 数据之前，默认值必须是「不做任何事」。
+    if (!SLFBool(@"WarmupEnabled", NO)) {
+        SLFLogAlways(@"[warmup] 已禁用（默认）。需要时可把 WarmupEnabled 设为 YES 做 A/B");
         return;
     }
 
@@ -238,8 +263,8 @@ void SLFWarmupStart(void) {
     NSInteger delayMS = SLFInt(@"WarmupDelayMS", 1500);
     if (delayMS < 0) delayMS = 0;
 
-    dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)delayMS * NSEC_PER_MSEC), q, ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)delayMS * NSEC_PER_MSEC),
+                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         @try {
             SLFWarmupRun();
         } @catch (__unused NSException *e) {

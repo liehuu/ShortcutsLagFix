@@ -37,7 +37,7 @@ Dopamine-roothide / Bootstrap 环境上，**不需要**再用 roothide Patcher �
 
 ```bash
 # 方式一：直接安装（在设备上，用 Sileo / Zebra / 命令行均可）
-dpkg -i shortcutslagfix_1.0.4_iphoneos-arm64e.deb
+dpkg -i shortcutslagfix_1.0.5_iphoneos-arm64e.deb
 killall -9 Shortcuts
 
 # 方式二：本地编译（需要 macOS + Xcode）
@@ -165,13 +165,13 @@ find /var/mobile/Containers/Data/Application -name "ShortcutsLagFix.log" 2>/dev/
   覆写了它的子类调用不经过插件，这两个数字只能用来看 hook 是否活着。
 - **`[hook]`** —— 每个 hook 的安装结果。若是 `SKIP`，说明该方法不在目标类自身的方法表里。
 
-## 实测诊断结论（v1.0.4 依据）
+## 实测诊断结论（截至 v1.0.5）
 
-下面是用户设备（iPhone12,3 / iOS 17.0.3）跑 v1.0.0 得到的真实数据，
-v1.0.4 的改动全部对准这些数字，不是凭空猜的。
+设备：iPhone12,3 / iOS 17.0.3。以下全部来自真实日志，每一条都能在日志里指到行。
 
-**体感量级**：从 13:03:11 到 13:04:04 约 53 秒内，主线程有 **16.65 秒**不可用（约 31%）。
-共 33 次 stall 上报，但按区间合并后是 14 段。
+### 第一次实测（v1.0.3，53 秒窗口）
+
+**主线程有 16.65 秒不可用（约 31%）**。33 次 stall 上报，按区间合并后是 **14 段**。
 
 | 段 | 时长 | 栈顶 | 归类 |
 |---|---|---|---|
@@ -181,18 +181,74 @@ v1.0.4 的改动全部对准这些数字，不是凭空猜的。
 | 13:03:45.304 | 1.53s | `mach_msg2_trap` | 等待消息 |
 | 13:04:02.957 | 1.17s | `semaphore_wait_trap` + **FrontBoardServices** | 跨进程 IPC |
 
-单项热点（可完全消除的一次性初始化）：
+⚠️ **33 条不能相加**：直接求和得 28.77 秒，虚报 73%。同一次阻塞每 100ms 重复上报一次，
+必须按区间求并集。v1.0.4 起日志会显式输出「上一段结束：持续 X 秒，期间上报 N 次」。
 
-| 时长 | 栈 | 处理 |
-|---|---|---|
-| 602ms | `stat` → `CFBurstTrieCreateFromFile` | v1.0.4 预热（词典 trie） |
-| 298ms | `CoreFoundation bsearch` → `CTFontCreateWithFontDescriptor` | v1.0.4 预热（字体） |
-| 285ms | `libmecab` + `CoreNLP` | v1.0.4 预热（语言分析） |
-| 313ms | `objc_getClassList` ← **SLFInstallOnce**（本插件自己） | v1.0.4 移到后台 |
+### 第二次实测（v1.0.4，35 秒窗口）
 
-### 插件自身也贡献了卡顿（已修）
+**主线程不可用约 7.8 秒（3 段：4.05s + 0.53s + 3.20s，另有 1 段 0.3s 未单独结算）。**
 
-第 1 次 stall 的栈里赫然是本插件：
+单看这个数字像是改善了，但**这一轮暴露的问题比解决的多**，所以不能这么比：
+
+1. 两次的观察窗口和你的操作不同（第一次 53 秒、第二次 35 秒），**不可直接对比**；
+2. v1.0.4 的预热自己跑了 **24 秒**；
+3. 看门狗有 **12 秒观测盲区**；
+4. 40 次上报上限被撞满后，**之后完全静音**。
+
+### ✗ v1.0.4 的预热是负优化（v1.0.5 已关闭）
+
+这是本版本最重要的结论，也是我必须先认的错。日志时间线：
+
+```
+13:27:34.287  [warmup] 开始
+13:27:34.305  [warmup] CoreText 字体 7.3ms          ← 好，预期内
+13:27:36.221  [warmup] 词典 trie 1779.3ms           ← 预期 298ms，超 6 倍
+13:27:39.940  主线程开始阻塞（第 1~23 次上报，合并成一段 4.05s）
+              栈顶：AutoFillUI → CFStringTokenizerCreate
+                    → CoreNLP → liblangid:langid_consume_string
+13:27:57.929  [warmup] 语言分析/mecab 21623.8ms     ← 21.6 秒！
+13:27:58.327  [warmup] 完成，共 24030.5ms
+```
+
+主线程卡住的那 4 秒，栈顶是 **CoreNLP + liblangid**；
+而我的预热当时正在另一个线程跑 `NLTokenizer` / `NLTagger`，**也是 CoreNLP + liblangid**。
+两者共用同一套全局分析器状态（首次初始化时持锁）——
+于是我"以为在帮它预热"，实际是"在跟它抢，把它拖住"。
+
+**教训比功能重要**：预热的安全性不能靠"我在后台线程"来论证。
+只要它触碰的是同一份全局状态，就可能在主线程最需要的时候把它锁住。
+
+所以 v1.0.5 的处置：
+
+- **`WarmupEnabled` 默认改为 `false`**（预热全部 opt-in）；
+- **删除语言分析预热整段**（`NLTokenizer` / `NLTagger` / 日文 mecab），并移除
+  `-framework NaturalLanguage` 依赖；
+- 剩余步骤（字体 / 词典 trie / ImageIO）加**硬超时**（`WarmupStepTimeoutMS`，默认 2000ms），
+  超时立刻放弃剩余步骤，不再出现"一步跑 21 秒"。
+
+### ✗ 看门狗曾有 12 秒盲区（v1.0.5 已修）
+
+日志里「上一段结束：持续 4.05s」这行的时间戳是 `13:27:56.056`，
+但这一段真实结束于 `13:27:43.99` —— **落盘晚了 12.07 秒**，那 12 秒内主线程状况没有任何记录。
+
+原因：三个 timer 挂在 `QOS_CLASS_UTILITY` 的**全局并发队列**上，worker 与别处共享。
+预热一旦在 background 队列跑起 21.6 秒的长任务，utility 的 timer 到点也要重新抢 worker，
+在 QoS 反压下被饿死。看门狗在自己最该工作的时候瞎了。
+
+v1.0.5 改为**私有串行队列 + `QOS_CLASS_USER_INITIATED`**，并在每次段结算时输出
+「本行落盘滞后 X 秒」—— 这个数字以后可以直接告诉你有没有盲区。
+
+### ✗ 撞到上报上限后彻底失明（v1.0.5 已修）
+
+`MaxStallReports` 达到 40 后，1.0.4 直接 `return`，**连段统计一起停掉**。
+日志末尾 `reports=40`，之后用户再点「新建」产生的卡顿一条记录都没有。
+
+v1.0.5 把配额检查移到段统计之后：**配额只限制抓栈与打印，段统计永远继续**，
+并在超限时打印一次提示。默认值也从 40 提到 60。
+
+### ✓ 插件自身曾贡献 631ms（v1.0.4 已修）
+
+v1.0.0 第 1 次 stall 的栈里赫然是本插件：
 
 ```
 #3  libobjc.A.dylib        objc_getClassList
@@ -200,22 +256,51 @@ v1.0.4 的改动全部对准这些数字，不是凭空猜的。
 #8  ShortcutsLagFix.dylib  __SLFScheduleSetup_block_invoke
 ```
 
-即 v1.0.0 在主线程上遍历全部已注册类（约 3 万个），耗时 **631ms**
-（日志时间戳 11.353 → 11.984）。这是纯粹的自造卡顿，与要诊断的问题无关。
-v1.0.4 已把这段扫描移到 `QOS_CLASS_BACKGROUND` 后台队列，并每 1000 个类让出一次
-runtime 锁（长时间持锁会让主线程的 msgSend 慢路径等锁，等于把卡顿换个名字）。
+主线程遍历全部已注册类（约 3 万个）耗时 **631ms**。慢的不是填充指针，而是对每类调
+`class_getSuperclass` / `class_copyMethodList` 会触发 `realizeClass`
+（实例化、挂方法列表、跑 `+load`）。
+
+v1.0.4 已移到后台队列 + 每 1000 个类让出一次 runtime 锁（长时间持锁会让主线程的
+msgSend 慢路径等锁，等于把卡顿换个名字）。
+
+### ✓ 栈偏移量曾全部不可用（v1.0.5 已修）
+
+v1.0.4 日志里 UIKitCore / CoreUI / CoreFoundation 的每一帧长这样：
+
+```
+#0  UIKitCore      <redacted>+0x508000000750
+#2  libsystem_kernel.dylib  mach_msg+0x188000000018
+```
+
+高位是 PAC 签名残留，低位才是真实偏移（`0x750`、`0x18`）。这种数字喂不进 `atos`，
+整个栈等于白抓。
+
+根因：`SLFImageNameAndOffset` 注释写着"改用 image 基址"，代码却在
+`dli_saddr <= addr` 时把偏移**改回** `addr - dli_saddr`；而 `addr` 从栈上读出时可能带
+PAC 高位、`dli_saddr` 是已剥离的干净地址，两者相减就产出天文数字。
+
+v1.0.5 的铁律：**偏移量只有一个来源 —— `addr - dli_fbase`**，符号名只作提示。
+现在栈帧格式为：
+
+```
+#5  CoreFoundation  0x3a1b2c       near CFRunLoopRunSpecific
+#6  UIKitCore       0x8c1a4
+```
+
+可以直接 `atos -o UIKitCore -arch arm64e 0x8c1a4`。
 
 ### 明确修不了的部分（不假装能修）
 
-- **ImageIO 3.13s**：App 在渲染图库图标时同步解压整张图，未做降采样。
-  拦截 `CGDataProviderCopyData` 或篡改返回的 CGImage 尺寸会破坏布局，
-  风险远大于收益。预热只能省掉库加载那一小段，省不掉解压本身。
+- **ImageIO 同步解压 3.13s**：App 渲染图库图标时同步解压整张图，未降采样。
+  拦截 `CGDataProviderCopyData` 或篡改返回的 CGImage 尺寸会破坏布局，风险远大于收益。
 - **SwiftUI / AttributeGraph**：14 段涉及视图图求值，最多的一段 3.1s。
-  这是 App 自身的 body 重算，插件无法在不改变渲染结果的前提下降本。
+  这是 App 自身的 body 重算，不改变渲染结果就降不下来。
 - **FrontBoardServices 903ms**：主线程同步等 SpringBoard 的跨进程调用。
-- **FLEXing.dylib**：你的设备装了 FLEX 调试工具（出现在 5 段里，涉及 4.45s）。
-  它会 hook 大量 UIView 方法并参与 UI 构建链。**建议关掉它再对比一次**，
-  否则测到的卡顿里混着调试器的开销。
+- **AutoFillUI 触发的语言识别**：v1.0.4 日志里主线程在
+  `AutoFillUI → CFStringTokenizerCreate → CoreNLP` 上耗掉 4 秒。
+  那是系统在密码自动填充栏里做语言判断，插件没有安全手段让它异步化。
+- **FLEXing.dylib**：v1.0.3 日志里出现 5 段、涉及 4.45s。
+  v1.0.4 日志里已不再出现，说明你已关掉 —— 请保持关闭状态再测，否则数据会混。
 
 ## 配置
 
@@ -230,16 +315,25 @@ runtime 锁（长时间持锁会让主线程的 msgSend 慢路径等锁，等于
 | `DebugLog` | bool | `true` | 日志总开关 |
 | `WatchdogEnabled` | bool | `true` | 卡顿看门狗 |
 | `StallThresholdMS` | int | `250` | 判定卡顿的阻塞时长阈值 |
-| `MaxStallReports` | int | `40` | 单次运行最多抓栈次数 |
+| `MaxStallReports` | int | `60` | 最多抓栈次数（超限后仍继续统计段，只是不再打印栈） |
 | `StatDumpInterval` | int | `30` | 统计输出间隔（秒），0 = 关闭 |
 | `OptDisableImplicitAnimations` | bool | `true` | reload 期间关闭隐式动画 |
-| `WarmupEnabled` | bool | `true` | 后台预热一次性系统初始化（v1.0.4 新增） |
-| `WarmupDelayMS` | int | `1500` | 预热启动延迟，给 App 启动让路（v1.0.4 新增） |
-| `ScanSubclasses` | bool | `true` | 后台扫描覆写 reloadData 的子类（v1.0.4 新增） |
+| `WarmupEnabled` | bool | **`false`** | 后台预热（v1.0.5 改为默认关闭，见上文反证） |
+| `WarmupDelayMS` | int | `1500` | 预热启动延迟，给 App 启动让路 |
+| `WarmupLanguage` | bool | `false` | 仅兼容旧配置保留，语言分析预热已整段删除 |
+| `WarmupStepTimeoutMS` | int | `2000` | 单个预热步骤的硬超时，超时放弃剩余步骤 |
+| `ScanSubclasses` | bool | `true` | 后台扫描覆写 reloadData 的子类 |
 
-> 升级安装时**不会**覆盖已有的配置文件（避免丢掉你的调参），
-> 所以上表最后三行在旧配置里可能不存在 —— 缺键时用内置默认值，功能正常。
-> 想关掉预热做 A/B 对比，手工加一行 `<key>WarmupEnabled</key><false/>` 即可。
+> 升级安装时**不会**覆盖已有的配置文件（避免丢掉你的调参），所以旧配置里
+> `WarmupEnabled` 可能仍是 `true`。**请手工改成 `false`**：
+>
+> ```bash
+> cd /var/mobile/Library/Preferences
+> plutil -replace WarmupEnabled -bool NO com.liehuu.shortcutslagfix.plist
+> killall -9 Shortcuts
+> ```
+>
+> 想自己做 A/B 就反过来设成 `true` 测一次，对比两次日志里的段总数与总时长。
 
 ## 安全设计
 

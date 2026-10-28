@@ -71,8 +71,9 @@ NSString *SLFStatDescribe(SLFStat *s);
 void SLFStartWatchdog(void);
 void SLFInstallHooks(void);
 
-/// 后台预热一次性系统初始化（字体 / 词典 / 语言分析 / ImageIO）。
-/// 必须在主线程之外调用；内部自行排队到后台并从文件作用域持有队列。
+/// 后台预热一次性系统初始化（字体 / 词典 trie / ImageIO）。
+/// ★ 默认关闭（WarmupEnabled=NO）。实测证明语言分析预热会与主线程争
+///   CoreNLP/liblangid 锁，把主线程拖住，因此该段已整段移除。
 void SLFWarmupStart(void);
 
 /// 主线程当前是否仍在正常响应（最近 200ms 内刷新过心跳）。

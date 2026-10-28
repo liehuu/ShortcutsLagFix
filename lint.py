@@ -132,8 +132,13 @@ def check_format(f, lines):
 
 
 # ---------- [3] 隐式声明 ----------
+# 注意：这里出现的返回类型必须覆盖项目里实际用到的全部类型。
+# 曾经漏掉 const char（SLFImageNameAndOffset 被误判未声明）、
+# 现在又漏掉 dispatch_queue_t（SLFWatchdogQueue 被误判未声明）。
+# 规则：新增任何非 void/BOOL 返回类型的 static 函数时，同步补这个正则。
 _DECL_PAT = re.compile(
-    r'\b(?:void|BOOL|int|NSInteger|uint64_t|const\s+char|NSString)\s*\*?\s*(SLF\w+)\s*\(')
+    r'\b(?:void|BOOL|int|NSInteger|uint64_t|const\s+char|NSString'
+    r'|dispatch_queue_t|dispatch_source_t|IMP)\s*\*?\s*(SLF\w+)\s*\(')
 
 
 def _collect_decls(lines):

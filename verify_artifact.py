@@ -215,12 +215,25 @@ def main(deb_path):
         expected = ["DebugLog", "WatchdogEnabled", "StallThresholdMS",
                     "MaxStallReports", "StatDumpInterval",
                     "OptDisableImplicitAnimations",
-                    "WarmupEnabled", "WarmupDelayMS", "ScanSubclasses"]
+                    "WarmupEnabled", "WarmupDelayMS",
+                    "WarmupLanguage", "WarmupStepTimeoutMS",
+                    "ScanSubclasses"]
         missing = [k for k in expected if k not in txt]
         if missing:
             bad("postinst 内嵌配置缺少键: %s" % ", ".join(missing))
         else:
             ok("postinst 内嵌配置含全部 %d 个键" % len(expected))
+
+        # ★ WarmupEnabled 必须是 false。
+        #   v1.0.4 默认 true，实测该预热与主线程争 CoreNLP 锁，把主线程拖了 4 秒。
+        #   这一条要真的断言值，不能只断言键存在 —— 否则默认值被改回 true 也检测不到。
+        m = re.search(r"<key>WarmupEnabled</key>\s*<(true|false)\s*/>", txt)
+        if m is None:
+            bad("postinst 里找不到 WarmupEnabled 的布尔值（无法确认默认关闭）")
+        elif m.group(1) != "false":
+            bad("WarmupEnabled 默认值是 %s，必须为 false（实测会与主线程争锁）" % m.group(1))
+        else:
+            ok("WarmupEnabled 默认 false（预热已改为 opt-in）")
 
     # ---- 3. data 清单 ----
     print("\n[3] data 清单与权限")

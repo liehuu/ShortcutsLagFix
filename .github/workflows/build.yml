@@ -125,7 +125,8 @@ jobs:
             || { echo "::error::build.sh 的 SOURCES 里没有 SLFWarmup.m"; exit 1; }
 
           # 4) 预热相关的系统框架必须链接，否则日志里的耗时只会是 0。
-          for fw in CoreText ImageIO NaturalLanguage; do
+          #    注意：v1.0.5 起**不再**要求 NaturalLanguage —— 语言分析预热已整段移除。
+          for fw in CoreText ImageIO; do
             grep -q "framework $fw" build.sh \
               || { echo "::error::build.sh 未链接 $fw"; exit 1; }
           done
@@ -135,6 +136,35 @@ jobs:
             || { echo "::error::postinst 内嵌配置缺 WarmupEnabled"; exit 1; }
           grep -q 'WarmupDelayMS' layout/DEBIAN/postinst \
             || { echo "::error::postinst 内嵌配置缺 WarmupDelayMS"; exit 1; }
+          grep -q 'WarmupStepTimeoutMS' layout/DEBIAN/postinst \
+            || { echo "::error::postinst 内嵌配置缺 WarmupStepTimeoutMS"; exit 1; }
+
+          # 6) ★ 预热默认值必须是 NO。
+          #    实测证据（用户 v1.0.4 日志）：默认开启的预热里有一步跑了 21.6 秒，
+          #    且与主线程争 CoreNLP/liblangid 锁，把主线程拖了 4 秒。
+          #    这条守卫防止后续有人把它改回 true。
+          grep -qE 'SLFBool\(@"WarmupEnabled",[[:space:]]*NO\)' \
+                     ShortcutsLagFix/SLFWarmup.m \
+            || { echo "::error::WarmupEnabled 的代码内默认值必须为 NO（实测会与主线程争锁）"; exit 1; }
+
+          # 7) ★ 语言分析预热不得加回来。
+          #    NLTokenizer / NLTagger 会触发 CoreNLP + liblangid 初始化，
+          #    而主线程的 AutoFillUI 也在用同一套东西。加回来就会重现 v1.0.4 的问题。
+          #    如果哪天真要恢复，必须先有无可争议的 A/B 数据，并同步放开这条守卫。
+          #    只匹配真实调用，别去碰注释里解释"为什么删掉它"的那几行。
+          if grep -nE '\[\[NLTokenizer|\[\[NLTagger|NLTagScheme' ShortcutsLagFix/*.m ; then
+            echo "::error::检测到 NLTagger/NLTokenizer 调用：语言分析预热会与主线程争 CoreNLP 锁，禁止加入"
+            exit 1
+          fi
+
+          # 8) ★ 偏移量只允许走 image 基址。
+          #    1.0.4 在 dli_saddr <= addr 时把偏移改回 addr - dli_saddr，
+          #    因 PAC 残留导致整个栈不可符号化。这条守卫防止它被写回去。
+          #    判据：outOff 与 dli_saddr 不得出现在同一行（正确实现里它们必然分行）。
+          if grep -nE 'outOff.*dli_saddr' ShortcutsLagFix/SLFWatchdog.m ; then
+            echo "::error::偏移量不得用 dli_saddr 计算，必须用 image 基址（PAC 残留会让结果不可符号化）"
+            exit 1
+          fi
 
           echo "版本与预热守卫通过"
 

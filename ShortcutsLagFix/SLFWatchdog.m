@@ -144,22 +144,40 @@ static void SLFCaptureStack(mach_port_t thread, SLFStackTrace *out) {
 #endif
 }
 
+// 单个 image 的合理上限。dyld shared cache 里最大的库也就几百 MB，
+// 超过 1GB 的"偏移"一定是地址被污染，不可能是真实偏移。
+#define SLF_MAX_IMAGE_SPAN (1ULL << 30)
+
 // 取地址所属 image 的短名与"相对 image 基址"的偏移。
 //
-// ★ 为什么必须用 image 基址而不是符号偏移（实测缺陷）：
-//   旧实现算的是 addr - dli_saddr。dladdr 对没有导出符号的帧会返回
-//   "最近的导出符号"，该符号地址可能**大于**目标地址，相减得到天文数字，
-//   于是日志里出现 <redacted>+0x7e0000000024 这种偏移。
-//   那种偏移量无法用于任何符号化工具，等于白抓。
-//   改成相对 dli_fbase 之后，输出形如 UIKitCore+0x8c1a4，可以直接
-//   用 atos / 崩溃日志对照定位，这才是可用的证据。
+// ★★ 两条都是实测踩出来的（v1.0.4 日志里的直接证据）：
+//
+//  (1) 必须相对 image 基址，不能用 dli_saddr。
+//      dladdr 对没有导出符号的帧返回"最近的导出符号"，该符号可能位于
+//      完全不同的段落，相减得到天文数字。
+//
+//  (2) ★ 1.0.4 最大的错误：注释写了 (1)，代码却在符号地址不大于目标地址时
+//      把偏移量 **改回** 符号相对偏移。而 addr 从栈上读出时可能带 PAC
+//      高位、符号地址是已剥离的干净值 —— 两者相减得到
+//      0x6280000001b4、0x188000000018 这类值（高位是签名残留，低位才是真实偏移）。
+//      结果：日志里 UIKitCore / CoreUI / CoreFoundation 的每一帧都无法符号化，
+//      整个栈等于白抓。这一次我自己的"修复"反倒制造了新的不可读。
+//
+//  → 现在的铁律：**偏移量只有一个来源 —— addr - dli_fbase**。
+//     符号名只用来提示"大致在哪个函数附近"，绝不参与偏移量计算。
 static const char *SLFImageNameAndOffset(uint64_t addr, uint64_t *outOff, const char **outSym) {
     static char buf[64];        // 单线程使用（看门狗串行），无需加锁
     Dl_info info;
     *outOff = 0;
     *outSym = NULL;
 
-    if (dladdr((const void *)(uintptr_t)addr, &info) == 0) {
+    uint64_t a = SLF_STRIP(addr);
+    if (a == 0) {
+        snprintf(buf, sizeof(buf), "?");
+        return buf;
+    }
+
+    if (dladdr((const void *)(uintptr_t)a, &info) == 0) {
         snprintf(buf, sizeof(buf), "?");
         return buf;
     }
@@ -171,14 +189,32 @@ static const char *SLFImageNameAndOffset(uint64_t addr, uint64_t *outOff, const 
     }
     snprintf(buf, sizeof(buf), "%s", img);
 
-    uint64_t base = (uint64_t)(uintptr_t)info.dli_fbase;
-    if (base != 0 && addr >= base) *outOff = addr - base;
+    uint64_t base = SLF_STRIP((uint64_t)(uintptr_t)info.dli_fbase);
+    if (base == 0) return buf;
 
-    // 只有当符号地址确实小于等于目标地址时，符号偏移才有意义。
-    if (info.dli_sname && info.dli_saddr &&
-        (uint64_t)(uintptr_t)info.dli_saddr <= addr) {
-        *outSym = info.dli_sname;
-        *outOff = addr - (uint64_t)(uintptr_t)info.dli_saddr;
+    uint64_t off = (a >= base) ? (a - base) : 0;
+    if (a < base || off > SLF_MAX_IMAGE_SPAN) {
+        // 地址仍被污染：逐级剥掉高位，取第一个能落回本 image 范围内的候选。
+        // 顺序从宽到窄 —— 先假设只多了 40 位以上的垃圾，再退到 32 位。
+        static const uint64_t kMasks[] = {
+            0x000000FFFFFFFFFFULL,
+            0x00000000FFFFFFFFULL,
+        };
+        for (size_t i = 0; i < sizeof(kMasks) / sizeof(kMasks[0]); i++) {
+            uint64_t cand = a & kMasks[i];
+            if (cand >= base && (cand - base) <= SLF_MAX_IMAGE_SPAN) {
+                a = cand;
+                off = cand - base;
+                break;
+            }
+        }
+    }
+    *outOff = off;
+
+    // 符号名仅作提示：要求符号地址也在本 image 内、且不晚于目标地址。
+    if (info.dli_sname && info.dli_saddr) {
+        uint64_t saddr = SLF_STRIP((uint64_t)(uintptr_t)info.dli_saddr);
+        if (saddr >= base && saddr <= a) *outSym = info.dli_sname;
     }
     return buf;
 }
@@ -197,10 +233,12 @@ static NSString *SLFRenderStack(const SLFStackTrace *st) {
         uint64_t off = 0;
         const char *sym = NULL;
         const char *img = SLFImageNameAndOffset(st->addrs[i], &off, &sym);
+        // 格式统一为「image + image 相对偏移」，可直接喂给：
+        //   atos -o UIKitCore -arch arm64e 0x8c1a4
+        // 符号名只跟在后面作参考（它是"最近的导出符号"，未必是真实函数）。
         if (sym != NULL) {
-            [sb appendFormat:@"    #%-2d %-26s %s+0x%llx\n", i, img, sym, off];
+            [sb appendFormat:@"    #%-2d %-26s 0x%-12llx near %s\n", i, img, off, sym];
         } else {
-            // 无符号：给出 image 相对偏移，可直接拿去 symbolicate。
             [sb appendFormat:@"    #%-2d %-26s 0x%llx\n", i, img, off];
         }
     }
@@ -304,6 +342,28 @@ static NSString *SLFSampleHotspots(mach_port_t thread, int rounds) {
 
 #pragma mark - 主线程心跳
 
+// 看门狗专用队列。
+//
+// ★ 为什么不能用 dispatch_get_global_queue（实测缺陷，代价是 12 秒盲区）：
+//   v1.0.4 把三个 timer 都挂在 QOS_CLASS_UTILITY 的全局并发队列上。
+//   全局队列的 worker 是共享的：预热一旦在 BACKGROUND 队列里跑起长任务
+//   （实测 21.6 秒），utility 的 timer 事件即使到点也要重新抢 worker，
+//   在 QoS 反压下被饿死。日志里「上一段结束」这行比段真实结束晚了 12.07 秒，
+//   那 12 秒内主线程状况**没有任何记录**——看门狗在自己最该工作的时候瞎了。
+//
+//   现在给它私有串行队列 + USER_INITIATED：独立队列不与他人抢 worker，
+//   更高 QoS 保证不被后台任务反压。串行也顺带消除了 tick 重入问题。
+static dispatch_queue_t SLFWatchdogQueue(void) {
+    static dispatch_queue_t q = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        dispatch_queue_attr_t attr = dispatch_queue_attr_make_with_qos_class(
+            DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0);
+        q = dispatch_queue_create("com.liehuu.shortcutslagfix.watchdog", attr);
+    });
+    return q;
+}
+
 static void SLFTouchPort(void) {
     // 记录主线程的 mach port，供后台线程抓栈使用。
     mach_port_t p = pthread_mach_thread_np(pthread_self());
@@ -344,10 +404,21 @@ static void SLFSegmentSummaryAndReset(void) {
     int n = atomic_load(&gSegReports);
     if (e >= s && n > 0) {
         double durS = (double)(e - s) / 1e9;
+        // ★ 必须同时输出"本行落盘距段真实结束过了多久"。
+        //   实测发现这个值能到 12 秒：看门狗 timer 挂在全局 QoS 队列上，
+        //   被同队列里的长任务饿死，那十几秒里主线程到底卡没卡完全没记录。
+        //   不显示这个延迟，读日志的人会把"本行时间戳"误当成"段结束时刻"，
+        //   进而把整条时间线对错位。
+        double lagS = (double)(SLFNowNS() - e) / 1e9;
+        if (lagS < 0) lagS = 0;
         // 只有持续够久或上报次数够多才值得单独总结，避免短抖动刷屏。
         if (durS >= 0.5 || n >= 3) {
             SLFLogAlways(@"[stall] 上一段结束：持续 %.2fs，期间上报 %d 次"
-                          "（同一段只算一次，请勿把上报次数或毫秒数累加）", durS, n);
+                          "（同一段只算一次，请勿把上报次数或毫秒数累加）"
+                          "｜段真实结束于本段最后一次上报时刻，本行落盘滞后 %.2fs%@",
+                          durS, n,
+                          lagS,
+                          (lagS > 1.0 ? @" ← 看门狗被饿死，该时段存在观测盲区" : @""));
         }
     }
     atomic_store(&gSegStartNS, 0);
@@ -377,24 +448,12 @@ static void SLFWatchdogTick(void) {
 
     // ---- 进入卡顿上报路径 ----
 
-    // 抓栈本身有开销，且连续卡顿期间栈几乎相同 → 同一段卡顿只抓一次。
-    // 用 CAS 抢占，避免两个 tick 重叠时重复抓栈。
-    // 注意：闸门在 tick 末尾必释放（无论抓栈成败），否则一次失败会永久静音。
-    bool expected = false;
-    if (!atomic_compare_exchange_strong(&gReporting, &expected, true)) {
-        return;
-    }
-
-    // 报告次数上限，防止极端情况下日志爆炸。
-    NSInteger maxReports = SLFInt(@"MaxStallReports", 40);
-    int done = atomic_load(&gReportCount);
-    if (done >= maxReports) {
-        atomic_store(&gReporting, false);
-        return;
-    }
-    atomic_store(&gReportCount, done + 1);
-
     // ---- 段归属判定 ----
+    // ★ 顺序很重要：必须放在"打印配额"之前。
+    //   1.0.4 把配额检查放在这里之前，达到 MaxStallReports 后直接 return，
+    //   连段统计一起停掉。实测日志末段 reports=40，之后用户再点「新建」
+    //   产生的卡顿**一条记录都没有** —— 工具恰恰在最需要它的时候失明了。
+    //   现在：配额只限制「抓栈 + 打印」，段统计永远继续。
     uint64_t stallStart = now - deltaMS * 1000000ULL;
     uint64_t segStart = atomic_load(&gSegStartNS);
     BOOL continuation = NO;
@@ -412,6 +471,29 @@ static void SLFWatchdogTick(void) {
     atomic_store(&gSegReports, atomic_load(&gSegReports) + 1);
     int segN = atomic_load(&gSegReports);
     double segDurS = (double)(now - segStart) / 1e9;
+
+    // ---- 打印配额（只约束抓栈与打印，不约束上面的段统计）----
+    NSInteger maxReports = SLFInt(@"MaxStallReports", 40);
+    int done = atomic_load(&gReportCount);
+    if (done >= maxReports) {
+        static _Atomic bool quotaWarned = false;
+        bool we = false;
+        if (atomic_compare_exchange_strong(&quotaWarned, &we, true)) {
+            SLFLogAlways(@"[stall] 已达上报上限 %ld 次：之后只累计段统计、不再抓栈。"
+                          "要更多现场请调大 MaxStallReports。", (long)maxReports);
+        }
+        return;
+    }
+
+    // 抓栈本身有开销，且连续卡顿期间栈几乎相同 → 同一段卡顿只抓一次。
+    // 用 CAS 抢占，避免两个 tick 重叠时重复抓栈。
+    // ★ 闸门必须在每一条出口上释放，否则一次失败会永久静音。
+    //   所以 CAS 放在所有"可能提前 return"的判断之后 —— 位置本身就是正确性保证。
+    bool expected = false;
+    if (!atomic_compare_exchange_strong(&gReporting, &expected, true)) {
+        return;
+    }
+    atomic_store(&gReportCount, atomic_load(&gReportCount) + 1);
 
     // 在后台线程抓主线程栈：此刻主线程正卡着，栈就是现场。
     SLFStackTrace st;
@@ -487,7 +569,7 @@ static void SLFStartWatchdogOnce(void) {
 
     // 100ms 一次：既能及时捕获 250ms 级卡顿，开销也可忽略（仅原子读）。
     dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
-        dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+        SLFWatchdogQueue());
     if (timer == NULL) {
         SLFLogAlways(@"[watchdog] timer 创建失败");
         return;
@@ -520,7 +602,7 @@ static void SLFStartWatchdogOnce(void) {
     // 改用"每次 tick 无条件投递"，代价仅是主队列上每秒 10 个空 block（可忽略），
     // 换来的是：主线程一恢复，心跳立刻重新走起来。
     dispatch_source_t beatTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
-        dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+        SLFWatchdogQueue());
     if (beatTimer != NULL) {
         gBeatTimer = beatTimer;
         dispatch_source_set_timer(beatTimer,
@@ -542,7 +624,7 @@ static void SLFStartWatchdogOnce(void) {
     if (dumpInterval > 0) {
         extern void SLFDumpStats(void);
         dispatch_source_t statTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
-            dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+            SLFWatchdogQueue());
         if (statTimer != NULL) {
             gStatTimer = statTimer;
             uint64_t iv = (uint64_t)dumpInterval * NSEC_PER_SEC;

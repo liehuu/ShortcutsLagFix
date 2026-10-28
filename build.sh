@@ -73,7 +73,9 @@ COMMON_FLAGS=(
     -framework CoreFoundation
     -framework CoreText
     -framework ImageIO
-    -framework NaturalLanguage
+    # 不再链接 NaturalLanguage：v1.0.5 已整段移除语言分析预热
+    # （实测它 21.6 秒且与主线程争 CoreNLP/liblangid 锁）。
+    # 保留链接也无害，但少一个依赖就少一处"看起来还在用"的误解。
     -dynamiclib
 )
 
