@@ -138,10 +138,35 @@ def main(deb_path):
             ok("含 %s" % key)
         else:
             bad("缺少 %s" % key)
-    if "Architecture: iphoneos-arm64" in ctrl:
-        ok("Architecture 正确")
+    # ★ 必须整行精确比对，不能用 `in ctrl` 做子串匹配。
+    # 原因：`"Architecture: iphoneos-arm64" in ctrl` 对
+    # `Architecture: iphoneos-arm64e` 同样为 True ——
+    # 换句话说，那个写法在架构值【错误】时也会报 OK，
+    # 是一个永远通过、毫无作用的假检查（本次事故正是因为
+    # 该检查从未真正生效，才让 iphoneos-arm64 的包一路交付出去）。
+    # 现在直接和 pack.py 的常量对齐，改了一处会立刻暴露。
+    arch_lines = [l.strip() for l in ctrl.splitlines()
+                  if l.lower().startswith("architecture:")]
+    if not arch_lines:
+        bad("control 中没有 Architecture 行")
     else:
-        bad("Architecture 不是 iphoneos-arm64")
+        got_arch = arch_lines[0].split(":", 1)[1].strip()
+        if got_arch == pack.ARCH:
+            ok("Architecture = %s（roothide 包布局）" % got_arch)
+        else:
+            bad("Architecture 为 %r，应为 %r —— "
+                "Sileo 会拒绝安装并提示 update for roothide；"
+                "强行用 roothide Patcher 转换会触发 "
+                "'.//rootfs/Library/MobileSubstrate: Operation not permitted'"
+                % (got_arch, pack.ARCH))
+
+    # roothide 的包结构必须与 rootful 包相同：dpkg 会自行把文件装进
+    # 随机化的 bootstrap 路径，包里【不能】自己带任何前缀。
+    for forbidden in ("/var/jb", "rootfs/"):
+        if forbidden in ctrl:
+            bad("control 中出现 %r，roothide 包不应自带路径前缀" % forbidden)
+        else:
+            ok("control 未出现 %r" % forbidden)
 
     # ---- 3. data 清单 ----
     print("\n[3] data 清单与权限")
@@ -163,6 +188,33 @@ def main(deb_path):
                 ok("存在 %s" % os.path.basename(m))
             else:
                 bad("缺少 %s" % m)
+
+        # ★ roothide 包布局硬约束：所有条目必须是纯 rootful 路径。
+        # 出现 ./rootfs/ 或 ./var/jb/ 就说明包被"转换"过或架构值写错，
+        # 装上去必然报 Operation not permitted。
+        # 这是用户实际遇到的报错原文：
+        #   error creating directory './rootfs/Library/MobileSubstrate':
+        #   Operation not permitted
+        bad_prefix = [n for n in infos
+                      if n.startswith("./rootfs/") or n.startswith("./var/jb/")
+                      or n == "./rootfs" or n == "./var/jb"]
+        if bad_prefix:
+            for n in bad_prefix:
+                bad("data 含非法前缀条目 %r（会被 libvroot 重映射到真实根，装不上）" % n)
+        else:
+            ok("data 全部为纯 rootful 路径（无 /var/jb、无 rootfs/ 前缀）")
+
+        # RootHide 只要求 dylib 里写 @loader_path/.jbroot/...，
+        # 【不需要】在包里真的放一个 .jbroot 符号链接 —— 该链接由 dpkg
+        # 或加载器在设备上创建。实测参考包（nolockwallpaper 1.7-1，
+        # 已在 roothide 设备安装成功）的 data.tar 里就没有 .jbroot。
+        # 这里做正向断言，防止以后有人"好心"加进去反而破坏布局。
+        jbroot_entries = [n for n in infos if ".jbroot" in n]
+        if jbroot_entries:
+            bad("data 里出现 .jbroot 条目 %r —— 该符号链接应由设备侧创建，"
+                "包内自带会导致布局异常" % jbroot_entries)
+        else:
+            ok("data 未内置 .jbroot（符合 RootHide 规范，由设备侧创建）")
 
         if must[0] in infos:
             embedded = t.extractfile(must[0]).read()
@@ -278,5 +330,5 @@ def main(deb_path):
 
 if __name__ == "__main__":
     path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
-        ROOT, "..", "deb_out", "shortcutslagfix_1.0.0_iphoneos-arm64.deb")
+        ROOT, "debs", "%s_%s_%s.deb" % (pack.NAME, pack.VERSION, pack.ARCH))
     sys.exit(main(path))

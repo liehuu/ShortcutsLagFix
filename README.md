@@ -32,13 +32,40 @@
 
 ## 安装
 
-```bash
-# 方式一：直接安装 CI 产物
-dpkg -i shortcutslagfix_1.0.0_iphoneos-arm64.deb
+本包是 **roothide 包**（`Architecture: iphoneos-arm64e`），可直接装在 RootHide /
+Dopamine-roothide / Bootstrap 环境上，**不需要**再用 roothide Patcher 转换。
 
-# 方式二：本地编译（需要 macOS + Xcode 或 Theos）
+```bash
+# 方式一：直接安装 CI 产物（在设备上，用 Sileo / Zebra / 命令行均可）
+dpkg -i shortcutslagfix_1.0.1_iphoneos-arm64e.deb
+
+# 方式二：本地编译（需要 macOS + Xcode）
 ./build.sh && python3 pack.py
 ```
+
+### 关于 Architecture 字段（踩过的坑，写在这里避免重复）
+
+`Architecture` 在 iOS 越狱生态里**不是 CPU 架构，而是包布局标志**：
+
+| 取值 | 含义 | 包内路径 |
+|---|---|---|
+| `iphoneos-arm` | rootful | 纯 `/Library/...`，无前缀 |
+| `iphoneos-arm64` | rootless | 带 `/var/jb` 前缀 |
+| `iphoneos-arm64e` | **roothide** | 纯 rootful 布局，前缀由 dpkg 自动加 |
+
+名字里的 `arm64e` 与芯片架构无关。写成 `iphoneos-arm64e` 的包里，照样放
+arm64 + arm64e 双切片 dylib。
+
+若误写成 `iphoneos-arm64`，会出现两种失败：
+
+1. Sileo 直接拒装，提示
+   `You can contact the developer of this package to update it for roothide`
+2. 用 roothide Patcher 强行转换后，路径被 libvroot 重映射出 `./rootfs/`，
+   dpkg 去写真实根 `/Library` 而那里不可写：
+   `error creating directory './rootfs/Library/MobileSubstrate': Operation not permitted`
+
+包内**不应**自带 `.jbroot` 符号链接，也不应出现 `rootfs/` 或 `/var/jb` 前缀 ——
+这些都由设备侧 dpkg / 加载器完成。`pack.py` 与 `verify_artifact.py` 已内置断言守卫。
 
 安装后必须重启快捷指令 App：
 

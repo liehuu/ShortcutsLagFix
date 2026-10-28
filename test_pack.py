@@ -121,11 +121,46 @@ def main():
         assert any(n.endswith("control") for n in cn), cn
         ctrl_txt = t.extractfile([n for n in cn if n.endswith("control")][0]).read().decode()
     os.remove(ctrl_path)
-    for key in ("Package: com.liehuu.shortcutslagfix",
-                "Architecture: iphoneos-arm64",
-                "Version: 1.0.0"):
-        assert key in ctrl_txt, "control 缺少: " + key
-    print("    control 内容 OK")
+    # ★ 用 pack 的常量断言，不再硬编码 "iphoneos-arm64" / "1.0.0"。
+    # 硬编码的后果：架构值从 iphoneos-arm64 改成 iphoneos-arm64e 时，
+    # 这个测试会因"找不到 'Architecture: iphoneos-arm64'"而失败 ——
+    # 看起来很"严格"，实际是测试写错了，反而会诱导人去改回错误的值。
+    for key in ("Package: %s" % pack.PKG,
+                "Architecture: %s" % pack.ARCH,
+                "Version: %s" % pack.VERSION):
+        # Architecture 必须整行匹配：子串匹配时 "iphoneos-arm64"
+        # 会被 "iphoneos-arm64e" 命中，等于永远通过。
+        if key.startswith("Architecture:"):
+            lines = [l.strip() for l in ctrl_txt.splitlines()]
+            assert key in lines, "control Architecture 行不等于 %r\n实际: %r" % (
+                key, [l for l in lines if l.lower().startswith("architecture")])
+        else:
+            assert key in ctrl_txt, "control 缺少: " + key
+    print("    control 内容 OK (Architecture=%s)" % pack.ARCH)
+
+    print("=== 5b. 回归：control 架构写错时必须被拦截 ===")
+    # 复刻本次真实事故：control 写成 rootless 的 iphoneos-arm64。
+    # 这个断言同时证明"闸门真的会响"，而不是摆设。
+    _real_root = pack.ROOT
+    try:
+        wrong_root = os.path.join(tmp, "wrongctrl")
+        os.makedirs(wrong_root, exist_ok=True)
+        with open(os.path.join(_real_root, "control"), "r", encoding="utf-8") as f:
+            real_ctrl = f.read()
+        with open(os.path.join(wrong_root, "control"), "w", encoding="utf-8") as f:
+            f.write(real_ctrl.replace("Architecture: " + pack.ARCH,
+                                      "Architecture: iphoneos-arm64"))
+        pack.ROOT = wrong_root
+        try:
+            pack.make_control()
+        except SystemExit:
+            print("    架构写错 -> 已拦截 OK")
+        else:
+            raise AssertionError(
+                "control 写成 iphoneos-arm64 却未报错，闸门失效！"
+                "这正是导致 Sileo 拒绝安装 'update it for roothide' 的根因")
+    finally:
+        pack.ROOT = _real_root
 
     print("=== 6. 校验 data.tar.gz 清单与权限 ===")
     data_path = os.path.join(pack.BUILD, "_t_data.tar.gz")

@@ -29,8 +29,34 @@ OUTDEB = os.path.join(ROOT, "debs")
 
 NAME = "shortcutslagfix"
 PKG = "com.liehuu.shortcutslagfix"
-VERSION = "1.0.0"
-ARCH = "iphoneos-arm64"
+VERSION = "1.0.1"
+
+# ---------------------------------------------------------------------------
+# Architecture 不是 CPU 架构，而是【包布局标志】。这是 RootHide 踩过的最大的坑：
+#
+#   iphoneos-arm     = rootful   （/ 就是真实根，无前缀）
+#   iphoneos-arm64   = rootless  （前缀 /var/jb）
+#   iphoneos-arm64e  = roothide  （随机 bootstrap 前缀）
+#
+# 名字里的 arm64e 与 CPU 架构毫无关系 —— 写成 iphoneos-arm64e 的包，
+# 里面照样可以（也应该）放 arm64 + arm64e 双切片 dylib。
+#
+# 实测证据（本机另一个已在 roothide 设备上安装成功的包
+# com.liehuu.nolockwallpaper_1.7-1）：
+#   · 同一次构建产出两个 deb，control 唯一差异就是这一行
+#   · 两者的 data.tar 文件清单【逐条完全相同】，均为纯 rootful 路径
+#     `./Library/MobileSubstrate/DynamicLibraries/...`，不含 /var/jb、
+#     不含 .jbroot 前缀目录、不含 rootfs/
+#   · dylib 的 LC_ID_DYLIB 为 `@loader_path/.jbroot/Library/...`
+#
+# 历史事故：曾写成 iphoneos-arm64，Sileo 拒绝安装并提示
+#   "You can contact the developer of this package to update it for roothide"
+# 用户用 roothide Patcher 强行转换后，路径被 libvroot 重映射出 `./rootfs/`，
+# dpkg 去写真实根 `/Library` 而那里不可写，报
+#   error creating directory './rootfs/Library/MobileSubstrate': Operation not permitted
+# 结论：不要靠 Patcher 转换，直接出 iphoneos-arm64e 包。
+# ---------------------------------------------------------------------------
+ARCH = "iphoneos-arm64e"
 
 DYLIB = os.path.join(BUILD, "ShortcutsLagFix.dylib")
 
@@ -110,16 +136,32 @@ def check_layout():
 
 
 def make_control():
-    control = """Package: {pkg}
-Name: ShortcutsLagFix
-Version: {ver}
-Architecture: {arch}
-Description: Diagnose and mitigate UI stalls when creating a new Shortcut (iOS 17). A main-thread watchdog captures the blocking stack, so the actual cause is identified from logs instead of guessed. All hooks use public UIKit APIs only. Config: /var/mobile/Library/Preferences/com.liehuu.shortcutslagfix.plist
-Maintainer: liehuu
-Author: liehuu
-Section: Tweaks
-Depends: mobilesubstrate
-""".format(pkg=PKG, ver=VERSION, arch=ARCH)
+    """读取仓库根目录的 control 文件，作为唯一真源。
+
+    历史上这里曾是硬编码的字符串副本，与根目录 control 形成两份真源。
+    改架构值时改了副本、忘了根文件（或反之），就会重演
+    iphoneos-arm64 / iphoneos-arm64e 那次安装失败。
+    现在只允许一处定义，并且在这里做一致性断言。
+    """
+    ctrl_path = os.path.join(ROOT, "control")
+    if not os.path.exists(ctrl_path):
+        die("缺少 control 文件: " + ctrl_path)
+    with open(ctrl_path, "r", encoding="utf-8") as f:
+        control = f.read()
+
+    # 断言：control 里的 Package / Version / Architecture 必须与脚本常量一致。
+    # 这样"改了 control 忘了改 pack.py"或反之，都会立刻炸出来。
+    for key, want in (("Package", PKG), ("Version", VERSION), ("Architecture", ARCH)):
+        got = None
+        for line in control.splitlines():
+            if line.lower().startswith(key.lower() + ":"):
+                got = line.split(":", 1)[1].strip()
+                break
+        if got != want:
+            die("control 的 %s 为 %r，与 pack.py 常量 %r 不一致。"
+                "两处必须同步，否则会产出错误的包。" % (key, got, want))
+
+    print("[pack] control 校验 OK (Architecture=%s, Version=%s)" % (ARCH, VERSION))
     return control.encode("utf-8")
 
 

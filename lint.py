@@ -294,12 +294,53 @@ def check_lock_logging(f, lines):
 
 
 # ---------- [14] 定时器未 static ----------
+# 规则本意：dispatch_source 若无人强持有，会在创建它的作用域结束后被释放，
+# 表现为"看门狗悄悄不再工作、日志一条不出"—— 属于最难排查的静默失效。
+#
+# 但早期实现是"这一行没有 static 关键字就报"，属于错误判据：
+#   实际代码是
+#       dispatch_source_t timer = dispatch_source_create(...);
+#       gTickTimer = timer;          // ← 存进了文件作用域强引用
+# 两行都正确，却被报成告警。这种误报比漏报更有害 ——
+# 一旦告警里混入大量噪音，真正致命的那条就没人看了。
+#
+# 现在按【真实判据】检查：局部 timer 变量最终有没有被赋给一个
+# 文件作用域的 static/全局槽位（约定以 g 开头）。
 def check_timer_static(f, lines):
-    for i, ln in enumerate(lines, 1):
+    # 收集文件作用域的强引用槽位：static dispatch_source_t gXxx
+    slots = set()
+    for ln in lines:
+        nc = re.sub(r"//.*$", "", ln)
+        m = re.match(r"\s*static\s+.*?\b(g\w+)\s*(?:=|;)", nc)
+        if m:
+            slots.add(m.group(1))
+
+    if not slots:
+        return
+
+    for i, ln in enumerate(lines):
         code = re.sub(r"//.*$", "", ln)
-        if "dispatch_source_create" in code:
-            if "static" not in code:
-                warn(f, i, "[14] dispatch_source_t 未声明为 static，可能被释放后静默失效")
+        if "dispatch_source_create" not in code:
+            continue
+        # 同行就存进槽位（static dispatch_source_t g = create(...)）也算合格
+        if any(re.search(r"\b%s\s*=" % s, code) for s in slots):
+            continue
+        # 取局部变量名
+        m = re.search(r"\b(\w+)\s*=\s*dispatch_source_create", code)
+        local = m.group(1) if m else None
+        if local is None:
+            warn(f, i + 1, "[14] dispatch_source_create 结果未赋给变量，无法持有")
+            continue
+        # 向后 12 行内查找 "槽位 = 局部变量;"
+        window = [re.sub(r"//.*$", "", x) for x in lines[i:i + 12]]
+        held = any(
+            re.search(r"\b%s\s*=\s*%s\s*;" % (s, re.escape(local)), w)
+            for w in window for s in slots
+        )
+        if not held:
+            warn(f, i + 1,
+                 "[14] 定时器 '%s' 未存入文件作用域强引用（槽位: %s），"
+                 "可能被释放后静默失效" % (local, ",".join(sorted(slots))))
 
 
 # ---------- [15] 构造函数 try/catch ----------

@@ -72,6 +72,35 @@ jobs:
             || { echo "::error::注入过滤 plist 缺失"; exit 1; }
           echo "预置文件完好"
 
+      - name: roothide 包格式专项守卫
+        run: |
+          # 本次真实事故（用户设备安装失败）的固化检查。
+          #
+          # 背景：Architecture 是【包布局标志】，不是 CPU 架构。
+          #   iphoneos-arm   = rootful
+          #   iphoneos-arm64 = rootless (/var/jb)
+          #   iphoneos-arm64e= roothide（随机 bootstrap 前缀）
+          # 曾误写成 iphoneos-arm64，Sileo 拒绝安装：
+          #   "You can contact the developer of this package to update it for roothide"
+          # 用 roothide Patcher 强转后路径被重映射出 ./rootfs/，dpkg 报：
+          #   error creating directory './rootfs/Library/MobileSubstrate':
+          #   Operation not permitted
+          #
+          # 关键点：这里的比对必须是【整行精确相等】。
+          # 若写成 grep -q "iphoneos-arm64"，"iphoneos-arm64e" 同样会命中，
+          # 这个检查就成了永远通过的死检查 —— 正是它导致错误包被交付出去。
+          grep -qx "Architecture: iphoneos-arm64e" control || {
+            echo "::error::control 的 Architecture 不是 iphoneos-arm64e（roothide 包布局），设备上会装不上"
+            exit 1
+          }
+
+          # 包结构必须是纯 rootful：不许自带 /var/jb 或 rootfs 前缀
+          if grep -qE "^(/var/jb|\./var/jb|rootfs/)" control; then
+            echo "::error::control 含路径前缀，roothide 包不应自带"
+            exit 1
+          fi
+          echo "roothide 包格式守卫通过"
+
       - name: 编译（arm64 + arm64e 双切片）
         run: |
           chmod +x build.sh
