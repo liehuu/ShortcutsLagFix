@@ -1,6 +1,6 @@
 Package: com.liehuu.shortcutslagfix
 Name: ShortcutsLagFix
-Version: 1.0.6
+Version: 1.0.7
 Architecture: iphoneos-arm64e
 Description: Diagnose and mitigate UI stalls when creating a new Shortcut (iOS 17). Includes a main-thread hang watchdog that captures the blocking stack, plus optional low-risk optimizations. All hooks use public UIKit APIs only.
 Maintainer: liehuu

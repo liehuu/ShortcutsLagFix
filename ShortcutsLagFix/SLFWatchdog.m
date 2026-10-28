@@ -29,7 +29,18 @@
 #import <unistd.h>
 #import <string.h>
 #import <stdio.h>
+#import <stdlib.h>
+#import <mach-o/dyld.h>
 #import <CoreFoundation/CoreFoundation.h>
+
+// ptrauth_strip 用于剥 fp 链返回地址的 PAC 签名。
+// 只在 arm64e 下有意义；旧 SDK 没有这个头文件时退回 48 位掩码（能力变差但不报错）。
+#if defined(__has_include)
+  #if __has_include(<ptrauth.h>)
+    #import <ptrauth.h>
+    #define SLF_HAVE_PTRAUTH 1
+  #endif
+#endif
 
 // 注意：不要 #import <mach/mach_vm.h>。
 // iOS SDK 里该头文件是占位桩，内容只有一行 `#error mach_vm.h unsupported.`
@@ -73,12 +84,36 @@ static _Atomic uint64_t gSegLastCaptureNS = 0;
 static _Atomic int gSegCaptureCount = 0;
 
 // 段内主线程状态采样（区分"在干活"与"在等待"）。
-static _Atomic int gSegBusyTicks = 0;     // run_state=RUNNING 且 CPU 在涨
-static _Atomic int gSegWaitTicks = 0;     // run_state=WAITING/UNINTERRUPTIBLE
+//
+// ★★ 1.0.6 实测推翻了这里的判据设计：
+//   41 段、66 次上报，**每一次** run_state 都落在 WAITING，
+//   「执行中」恒为 0 次。但同一批段的 PC 重复率是 0%~56%（低），
+//   说明 PC 在不停变化 —— 主线程明明在推进。
+//   两条观测直接矛盾，说明 run_state 这个来源在本机不可信
+//   （可能恒报"不在 CPU 上"，也可能采样时刻总落在 mach_msg 里）。
+//
+//   → 修正：主判据换成 **CPU 时间增量 / 墙钟增量**。
+//     这是内核累计计数器，只能单调递增，不会说谎：
+//       ratio ≥ 0.5  → 这一拍大半时间在烧 CPU，确实在执行
+//       ratio ≤ 0.15 → 几乎没烧 CPU，真的在等锁 / 等 IPC
+//     中间的区间单独计为"混合"，不再硬塞进两边。
+//   → run_state 降级为**观测项**：只记录它的原始值分布并打印出来，
+//     让下一轮日志自己证明它是不是恒为某值。不再拿它做判定。
+static _Atomic int gSegBusyTicks = 0;     // CPU 增量占比 ≥ 50%
+static _Atomic int gSegWaitTicks = 0;     // CPU 增量占比 ≤ 15%
+static _Atomic int gSegMixedTicks = 0;    // 介于两者之间
 static _Atomic int gSegPCSamples = 0;     // 参与比较的采样数
 static _Atomic int gSegPCSame = 0;        // 与上一次采样 PC 相同的次数
 static _Atomic uint64_t gSegLastPC = 0;
 static _Atomic uint64_t gLastMainCPUms = 0;   // 上一个 tick 读到的累计 CPU 毫秒
+// 段内 CPU 时间累计与墙钟累计（微秒），用于算整段的平均 CPU 占用率。
+static _Atomic uint64_t gSegCPUusSum = 0;
+static _Atomic uint64_t gSegWallusSum = 0;
+// run_state 原始值出现过的集合（位图，bit n = 值 n 出现过）。
+// 只用于"自证该 API 是否可用"，绝不参与判定。
+static _Atomic uint32_t gSegRunStateMask = 0;
+// 整段观测期内 run_state 各值的出现次数，便于打印"WAITING 6 次 / RUNNING 0 次"。
+static _Atomic int gSegRunStateHist[8];
 
 // 前置声明：SLFWatchdogHealthCheck 定义在下方，但被上方的定时器 block 引用。
 void SLFWatchdogHealthCheck(void);
@@ -216,104 +251,212 @@ static uint64_t SLFPeekMainPC(void) {
 }
 
 
-// 单个 image 的合理上限。dyld shared cache 里最大的库也就几百 MB，
-// 超过 1GB 的"偏移"一定是地址被污染，不可能是真实偏移。
-#define SLF_MAX_IMAGE_SPAN (1ULL << 30)
+// 单个 image 的合理上限。dyld shared cache 里最大的库也就几十 MB，
+// 超过 512MB 的"偏移"一定是地址被污染，不可能是真实偏移。
+#define SLF_MAX_IMAGE_SPAN (512ULL << 20)
 
 // outOff 取这个值表示"这个偏移不可用"，渲染层据此打印原始地址而不是假偏移。
 #define SLF_OFF_UNUSABLE UINT64_MAX
 
-// 用 image 基址的干净高位 + 目标地址的可信低位，重建一个落在本 image 内的地址。
+#pragma mark - 已加载 image 表
+
+// ★★ 为什么要有这张表（1.0.6 日志实测，两次尝试都失败的教训）：
 //
-// 为什么必须这样重建（而不是掩码/右截位）：
-//   arm64e 的 PAC 签名位落在 bit 32~63，掩 48 位根本剥不干净；
-//   而 image 内偏移一定远小于 1GB，所以"低位可信、高位不可信"这条前提是稳的。
-//   从 44 位起逐级放宽，第一个落进 [base, base+1GB] 的候选即为答案。
-//   若连 24 位都不成立，说明这帧根本不是本 image 的地址，返回 0 交给上层报错。
-static uint64_t SLFRealignToBase(uint64_t a, uint64_t base) {
-    for (int lowBits = 44; lowBits >= 24; lowBits -= 4) {
-        uint64_t m = (1ULL << lowBits) - 1ULL;
-        uint64_t cand = (a & m) | (base & ~m);
-        if (cand >= base && (cand - base) <= SLF_MAX_IMAGE_SPAN) return cand;
-    }
+//   1.0.4/1.0.5 的做法是「掩 48 位 → 若仍不合理就猜位重建」。
+//   两版都失败，原因不是掩码位置选错，而是**前提就错了**：
+//   一旦地址被污染，就没有任何可靠办法判断"哪些位可信"。
+//   实测 663 帧形如 `SwiftUI 0x81800072d258`，其中 0x72d258 是真实偏移，
+//   0x818000 是签名残留 —— 但仅凭这个数字，我无法区分两种可能：
+//   是"高位混入签名"还是"低位本来就这么大"。
+//   猜错的代价是给出一个能通过范围检查、却是假的偏移。
+//
+//   → 现在换掉整个思路：**不问"哪些位可信"，改问"它落在哪个 image 里"**。
+//     dyld 自己报的每个 image 基址是绝对干净的（内核/loader 给的），
+//     并且共享缓存里的 image 是紧密连续排布的，"最大 base ≤ a"就能定出归属，
+//     用下一个 image 的 base 当上界 —— 落在缝隙里就明确判为不可用。
+//     污染地址几乎必然落不进任何 image 的真实范围，于是会被诚实地拒掉，
+//     而不是输出一个假偏移。
+typedef struct {
+    uint64_t base;
+    const char *name;   // 指向 dyld 内部的字符串，生命周期同进程，不必复制
+} SLFImageEntry;
+
+static SLFImageEntry *gImages = NULL;
+static int gImageCount = 0;
+// 建表时的 dyld image 数量。dlopen 会让实际数量增长，表就过时；
+// 查找失败时用这个差值判断"要不要重建"，避免对着旧表反复判不可用。
+static _Atomic uint32_t gBuiltImageCount = 0;
+// 重建节流：一帧一帧地查，不能每帧都重建整张表。
+static _Atomic uint64_t gLastRebuildNS = 0;
+
+static int SLFCompareImageBase(const void *a, const void *b) {
+    uint64_t x = ((const SLFImageEntry *)a)->base;
+    uint64_t y = ((const SLFImageEntry *)b)->base;
+    if (x < y) return -1;
+    if (x > y) return 1;
     return 0;
+}
+
+// 建表。初始化阶段调用一次；dlopen 之后由 SLFEnsureImageTableFresh 触发重建。
+// 成本：几百次 dyld 数组读取 + 一次 qsort，对启动无可见影响。
+// 旧表不 free：它可能正被渲染中的栈字符串引用（name 指针来自 dyld，本身安全），
+// 而这个插件一次运行最多重建几次，泄漏几十 KB 远好过 use-after-free。
+void SLFBuildImageTable(void) {
+    uint32_t n = _dyld_image_count();
+    if (n == 0) return;
+
+    SLFImageEntry *arr = (SLFImageEntry *)calloc(n, sizeof(SLFImageEntry));
+    if (arr == NULL) return;
+
+    int k = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const struct mach_header *h = _dyld_get_image_header(i);
+        const char *nm = _dyld_get_image_name(i);
+        if (h == NULL || nm == NULL) continue;
+        arr[k].base = (uint64_t)(uintptr_t)h;
+        const char *slash = strrchr(nm, '/');
+        arr[k].name = slash ? slash + 1 : nm;
+        k++;
+    }
+    if (k == 0) { free(arr); return; }
+
+    qsort(arr, (size_t)k, sizeof(SLFImageEntry), SLFCompareImageBase);
+    gImages = arr;                            // 先填内容再发布指针（顺序不能反）
+    gImageCount = k;
+    atomic_store(&gBuiltImageCount, n);
+}
+
+// 查找失败时调用：若 dyld 报的 image 数比建表时多，说明期间 dlopen 过，
+// 重建一次再试。节流 1 秒，避免在几百帧上反复重建。
+static void SLFEnsureImageTableFresh(void) {
+    uint32_t nowCount = _dyld_image_count();
+    if (nowCount == atomic_load(&gBuiltImageCount)) return;
+
+    uint64_t now = SLFNowNS();
+    uint64_t last = atomic_load(&gLastRebuildNS);
+    if (last != 0 && now - last < NSEC_PER_SEC) return;
+    atomic_store(&gLastRebuildNS, now);
+
+    SLFBuildImageTable();
+}
+
+// 在一张地址里找出它的归属 image，并给出 image 相对偏移。
+// 返回 NULL 表示"这个地址不属于任何已加载 image" —— 调用方必须据此报不可用。
+static const SLFImageEntry *SLFFindImage(uint64_t a, uint64_t *outOff) {
+    if (gImages == NULL || gImageCount == 0 || a == 0) return NULL;
+
+    // 二分：找最大的 base ≤ a
+    int lo = 0, hi = gImageCount - 1, best = -1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (gImages[mid].base <= a) { best = mid; lo = mid + 1; }
+        else { hi = mid - 1; }
+    }
+    if (best < 0) return NULL;
+
+    uint64_t off = a - gImages[best].base;
+    // 上界用下一个 image 的起点：共享缓存里 image 紧密排布，缝隙极小，
+    // 落在缝隙里说明这个地址不属于任何 image。
+    if (best + 1 < gImageCount && a >= gImages[best + 1].base) return NULL;
+    if (off > SLF_MAX_IMAGE_SPAN) return NULL;
+
+    *outOff = off;
+    return &gImages[best];
+}
+
+// 剥掉"从栈内存直接读出来的返回地址"上的 PAC 签名。
+//
+// ★ 这是 1.0.6 仍然 663 帧不可符号化的真正原因：
+//   PC/FP/LR 是从 thread_get_state 拿的，SDK 的 __darwin_arm_thread_state64_get_*
+//   访问器**内部已经剥过签名**；而 fp 链里的返回地址是我用 vm_read_overwrite
+//   直接从栈内存读的原始值 —— 它从来没经过任何剥离，
+//   签名位就留在 bit 32~47 之内，掩 48 位当然剥不掉。
+//   → 必须用与签名时相同的 key 显式 strip：返回地址用 return_address key。
+//   ptrauth_strip 只清签名位、不做验证，对任意值调用都是安全的。
+static uint64_t SLFStripReturnAddr(uint64_t p) {
+#ifdef SLF_HAVE_PTRAUTH
+    return (uint64_t)(uintptr_t)ptrauth_strip((void *)(uintptr_t)p,
+                                              ptrauth_key_return_address);
+#else
+    return p & SLF_USER_VA_MASK;
+#endif
 }
 
 // 取地址所属 image 的短名与"相对 image 基址"的偏移。
 //
-// ★★ 两条都是实测踩出来的（v1.0.4 日志里的直接证据）：
-//
-//  (1) 必须相对 image 基址，不能用 dli_saddr。
-//      dladdr 对没有导出符号的帧返回"最近的导出符号"，该符号可能位于
-//      完全不同的段落，相减得到天文数字。
-//
-//  (2) ★ 1.0.4 最大的错误：注释写了 (1)，代码却在符号地址不大于目标地址时
-//      把偏移量 **改回** 符号相对偏移。而 addr 从栈上读出时可能带 PAC
-//      高位、符号地址是已剥离的干净值 —— 两者相减得到
-//      0x6280000001b4、0x188000000018 这类值（高位是签名残留，低位才是真实偏移）。
-//      结果：日志里 UIKitCore / CoreUI / CoreFoundation 的每一帧都无法符号化，
-//      整个栈等于白抓。这一次我自己的"修复"反倒制造了新的不可读。
-//
-//  → 现在的铁律：**偏移量只有一个来源 —— addr - dli_fbase**。
-//     符号名只用来提示"大致在哪个函数附近"，绝不参与偏移量计算。
+// 只有一条规则：**归属由 image 表决定，偏移只能来自 a - base**。
+// 任何"猜位重建"都被彻底移除 —— 那种做法已经在两版日志里各失败一次。
 static const char *SLFImageNameAndOffset(uint64_t addr, uint64_t *outOff, const char **outSym) {
     static char buf[64];        // 单线程使用（看门狗串行），无需加锁
-    Dl_info info;
     *outOff = 0;
     *outSym = NULL;
 
-    uint64_t a = SLF_STRIP(addr);
-    if (a == 0) {
+    if (addr == 0) {
         snprintf(buf, sizeof(buf), "?");
         return buf;
     }
 
-    if (dladdr((const void *)(uintptr_t)a, &info) == 0) {
-        snprintf(buf, sizeof(buf), "?");
-        return buf;
-    }
+    // 三级尝试，从"最正确的解释"逐步退到"最宽松的解释"：
+    //   1) ptrauth_strip(return_address) —— arm64e 上栈返回地址的正确剥离方式
+    //   2) 纯 48 位掩码 —— 对已经从寄存器读出的 PC/LR 够用
+    //   3) 刷新 image 表后重做 1)、2) —— 覆盖运行期 dlopen 的情况
+    // 三级都失败就诚实报"不可用"，绝不给假偏移。
+    uint64_t a = SLFStripReturnAddr(addr);
+    uint64_t off = 0;
+    const SLFImageEntry *ent = SLFFindImage(a, &off);
 
-    const char *img = "?";
-    if (info.dli_fname) {
-        const char *slash = strrchr(info.dli_fname, '/');
-        img = slash ? slash + 1 : info.dli_fname;
-    }
-    snprintf(buf, sizeof(buf), "%s", img);
-
-    uint64_t base = SLF_STRIP((uint64_t)(uintptr_t)info.dli_fbase);
-    if (base == 0) return buf;
-
-    uint64_t off = (a >= base) ? (a - base) : 0;
-
-    // ★★ 1.0.5 仍然不可用的原因（本轮日志实测）：
-    //   fp 链里读出的返回地址带 PAC，而 SLF_STRIP 的 48 位掩码**剥不掉**它 ——
-    //   PAC 落在 bit 32~47 这一段，剥完仍在 48 位内，于是 a 保持一副"合法"长相。
-    //   实测值：0x81800072d258 / 0x4d80003b2b90 / 0x8e8000003c3c，
-    //   高位是签名残留，低 ~20 位才是真实偏移。
-    //   1.0.5 的回退逻辑用"逐级右截位"（40/32 位）去猜，但截完的候选值
-    //   必然远小于 image 基址（基址在 0x1a8_xxxxxxxx 一带），于是全部不满足，
-    //   污染值被原样输出 —— 663 帧不可符号化。
-    //
-    //   正确做法：**用 base 的干净高位 + a 的可信低位重建**。
-    //   image 内偏移一定远小于 1GB，所以 a 的低位是可信的，高位一律取 base 的。
-    if (a < base || off > SLF_MAX_IMAGE_SPAN) {
-        uint64_t fixed = SLFRealignToBase(a, base);
-        if (fixed != 0) {
-            a = fixed;
-            off = fixed - base;
-        } else {
-            // 重建也失败：明确标记为无效，由渲染层打印原始值。
-            // 绝不输出一个"看起来像偏移"的假值 —— 假证据比没有证据更糟。
-            *outOff = SLF_OFF_UNUSABLE;
-            return buf;
+    if (ent == NULL) {
+        uint64_t a2 = addr & SLF_USER_VA_MASK;
+        if (a2 != a) {
+            ent = SLFFindImage(a2, &off);
+            if (ent != NULL) a = a2;
         }
     }
+
+    if (ent == NULL) {
+        SLFEnsureImageTableFresh();
+        uint64_t a3 = SLFStripReturnAddr(addr);
+        ent = SLFFindImage(a3, &off);
+        if (ent != NULL) {
+            a = a3;
+        } else {
+            uint64_t a4 = addr & SLF_USER_VA_MASK;
+            if (a4 != a3) {
+                ent = SLFFindImage(a4, &off);
+                if (ent != NULL) a = a4;
+            }
+        }
+    }
+
+    if (ent == NULL) {
+        // 落不进任何 image：明确判不可用，由渲染层打印原始值。
+        // 绝不输出一个"看起来像偏移"的假值 —— 假证据比没有证据更糟。
+        const char *nm = "?";
+        Dl_info info;
+        // 仍尝试拿个 image 名当线索（dladdr 对污染值也可能命中，只作提示）。
+        if (dladdr((const void *)(uintptr_t)a, &info) != 0 && info.dli_fname != NULL) {
+            const char *slash = strrchr(info.dli_fname, '/');
+            nm = slash ? slash + 1 : info.dli_fname;
+        }
+        snprintf(buf, sizeof(buf), "%s", nm);
+        *outOff = SLF_OFF_UNUSABLE;
+        return buf;
+    }
+
+    snprintf(buf, sizeof(buf), "%s", ent->name);
     *outOff = off;
 
-    // 符号名仅作提示：要求符号地址也在本 image 内、且不晚于目标地址。
-    if (info.dli_sname && info.dli_saddr) {
-        uint64_t saddr = SLF_STRIP((uint64_t)(uintptr_t)info.dli_saddr);
-        if (saddr >= base && saddr <= a) *outSym = info.dli_sname;
+    // 符号名仅作提示：要求符号地址也落在这个 image 内、且不晚于目标地址。
+    // 系统库大量符号被标成 "<redacted>"，那种名字没有任何信息量，
+    // 直接丢弃 —— 打印 `near <redacted>` 只会让人误以为找到了函数。
+    Dl_info info;
+    if (dladdr((const void *)(uintptr_t)a, &info) != 0 && info.dli_sname != NULL) {
+        if (strcmp(info.dli_sname, "<redacted>") != 0) {
+            uint64_t saddr = SLFStripReturnAddr((uint64_t)(uintptr_t)info.dli_saddr);
+            uint64_t soff = 0;
+            const SLFImageEntry *sent = SLFFindImage(saddr, &soff);
+            if (sent == ent && saddr <= a) *outSym = info.dli_sname;
+        }
     }
     return buf;
 }
@@ -335,11 +478,13 @@ static NSString *SLFRenderStack(const SLFStackTrace *st) {
         // 格式统一为「image + image 相对偏移」，可直接喂给：
         //   atos -o UIKitCore -arch arm64e 0x8c1a4
         // 符号名只跟在后面作参考（它是"最近的导出符号"，未必是真实函数）。
-        if (off == SLF_OFF_UNUSABLE) {
-            // 偏移无法重建：把原始值打出来（这才是排查依据）。
+        if (off == SLF_OFF_UNUSABLE || strcmp(img, "?") == 0) {
+            // 归属不明：把原始值打出来（这才是排查依据）。
             // 宁可明说"不可用"，也不输出一个看着像偏移的假值。
-            [sb appendFormat:@"    #%-2d %-26s 偏移不可用 raw=0x%llx\n",
-             i, img, st->addrs[i]];
+            // 1.0.6 日志里出现过 `#2  ?  0x0` 这种行 —— 既不知道是谁，也不是 0 偏移，
+            // 打印成 0x0 会被人当成"偏移 0"，所以明确写成「无法解析」。
+            [sb appendFormat:@"    #%-2d %-26s 无法解析 raw=0x%llx\n",
+             i, "<不属于任何 image>", st->addrs[i]];
         } else if (sym != NULL) {
             // 格式统一为「image + image 相对偏移」，可直接喂给：
             //   atos -o UIKitCore -arch arm64e 0x8c1a4
@@ -446,9 +591,16 @@ static NSString *SLFSampleHotspots(mach_port_t thread, int rounds) {
             const char *img = SLFImageNameAndOffset(st.addrs[i], &off, &sym);
             // 立刻格式化成 NSString：SLFImageNameAndOffset 返回的是静态缓冲区，
             // 下一次调用会覆盖它，不能保存指针。
-            NSString *k = sym
-                ? [NSString stringWithFormat:@"%s %s+0x%llx", img, sym, off]
-                : [NSString stringWithFormat:@"%s 0x%llx", img, off];
+            NSString *k;
+            if (off == SLF_OFF_UNUSABLE) {
+                // 归属不明时按原始地址聚合 —— 同一处反复出现的地址本身就是热点，
+                // 不能因为算不出偏移就把它丢掉（那等于把断链的栈又白采一遍）。
+                k = [NSString stringWithFormat:@"raw 0x%llx", st.addrs[i]];
+            } else if (sym != NULL) {
+                k = [NSString stringWithFormat:@"%s %s+0x%llx", img, sym, off];
+            } else {
+                k = [NSString stringWithFormat:@"%s 0x%llx", img, off];
+            }
             hits[k] = @([hits[k] integerValue] + 1);
         }
         usleep(10 * 1000);
@@ -554,31 +706,61 @@ static void SLFSegmentSummaryAndReset(void) {
             // 这是 1.0.6 新增的关键判据：没有它，"忙 20 秒"会被当成"死锁 20 秒"。
             int busy = atomic_load(&gSegBusyTicks);
             int wait = atomic_load(&gSegWaitTicks);
+            int mixed = atomic_load(&gSegMixedTicks);
             int pcS = atomic_load(&gSegPCSamples);
             int pcSame = atomic_load(&gSegPCSame);
             int capped = atomic_load(&gSegCaptureCount);
+            int samples = busy + wait + mixed;
 
-            if (busy + wait > 0) {
+            if (samples > 0) {
                 NSString *verdict;
-                double busyRatio = (double)busy / (double)(busy + wait);
-                if (busyRatio >= 0.65) {
-                    verdict = @"主队列繁忙：主线程一直在干活，心跳只是排不上队（不是死锁）";
-                } else if (busyRatio <= 0.35) {
+                if (busy * 100 >= samples * 60) {
+                    verdict = @"主线程在执行（在烧 CPU）：不是死锁，是活太多";
+                } else if (wait * 100 >= samples * 60) {
                     verdict = @"主线程真卡在等待上（等锁 / 等 IPC），属于 hang";
+                } else if (mixed * 100 >= samples * 50) {
+                    verdict = @"混合：边等边跑，典型是循环里反复等同一把锁";
                 } else {
-                    verdict = @"混合：一半在跑、一半在等";
+                    verdict = @"混合：既有执行段也有等待段";
                 }
-                SLFLogAlways(@"[stall]   本段主线程状态：执行中 %d 次 / 等待中 %d 次"
+                SLFLogAlways(@"[stall]   本段主线程状态：执行中 %d / 等待中 %d / 混合 %d"
                               "（共采样 %d 次）→ %@",
-                              busy, wait, busy + wait, verdict);
+                              busy, wait, mixed, samples, verdict);
+
+                // CPU 占用率是这一版的**主判据**：内核累计计数器，只会单调递增，
+                // 不会像 run_state 那样给出与 PC 变化自相矛盾的结果。
+                uint64_t cpuSum = atomic_load(&gSegCPUusSum);
+                uint64_t wallSum = atomic_load(&gSegWallusSum);
+                if (wallSum > 0) {
+                    SLFLogAlways(@"[stall]   本段平均 CPU 占用率 %.0f%%"
+                                  "（这一段的墙钟时间里，主线程有多少比例真的在烧 CPU）",
+                                  (double)cpuSum * 100.0 / (double)wallSum);
+                }
+
+                // run_state 原始分布 —— 这是自证项，不是判据。
+                // 1.0.6 实测它 66 次全报 WAITING 而 PC 一直在变，
+                // 这一行就是为了让下一轮日志能直接确认它是否可信。
+                SLFLogAlways(@"[stall]   本段 run_state 原始值：RUNNING %d / WAITING %d / "
+                              "UNINTERRUPTIBLE %d / 其他 %d（仅作观测，不参与判定）",
+                              atomic_load(&gSegRunStateHist[TH_STATE_RUNNING]),
+                              atomic_load(&gSegRunStateHist[TH_STATE_WAITING]),
+                              atomic_load(&gSegRunStateHist[TH_STATE_UNINTERRUPTIBLE]),
+                              samples - atomic_load(&gSegRunStateHist[TH_STATE_RUNNING])
+                                      - atomic_load(&gSegRunStateHist[TH_STATE_WAITING])
+                                      - atomic_load(&gSegRunStateHist[TH_STATE_UNINTERRUPTIBLE]));
             }
             if (pcS >= 3) {
                 double sameRatio = (double)pcSame / (double)pcS;
-                SLFLogAlways(@"[stall]   本段 PC 重复率 %.0f%%（%d/%d）%s",
+                // ★ 实测缺陷（1.0.6 日志）：这里原本用 %s 传中文字面量，
+                //   而 -[NSString initWithFormat:] 的 %s 按 **MacRoman** 解释字节，
+                //   不是 UTF-8。于是「在持续变化」变成「Âú®ÊåÅÁª≠ÂèòÂåñ」。
+                //   乱码出现的正是最需要读的那两行诊断结论 —— 工具在最关键处自毁可读性。
+                //   铁律：交给 NSString 格式化的中文字面量必须是 @"..."。
+                SLFLogAlways(@"[stall]   本段 PC 重复率 %.0f%%（%d/%d）%@",
                               sameRatio * 100.0, pcSame, pcS,
                               sameRatio >= 0.8
-                                ? " ← 几乎停在同一条指令上，倾向单点卡死"
-                                : " ← PC 在持续变化，倾向在推进");
+                                ? @" ← 几乎停在同一条指令上，倾向单点卡死"
+                                : @" ← PC 在持续变化，倾向在推进");
             }
             SLFLogAlways(@"[stall]   本段抓栈 %d 次（已按 StallResampleMS 抽稀，"
                           "同一段的重复上报不再重复抓栈）", capped);
@@ -591,9 +773,14 @@ static void SLFSegmentSummaryAndReset(void) {
     atomic_store(&gSegCaptureCount, 0);
     atomic_store(&gSegBusyTicks, 0);
     atomic_store(&gSegWaitTicks, 0);
+    atomic_store(&gSegMixedTicks, 0);
     atomic_store(&gSegPCSamples, 0);
     atomic_store(&gSegPCSame, 0);
     atomic_store(&gSegLastPC, 0);
+    atomic_store(&gSegCPUusSum, 0);
+    atomic_store(&gSegWallusSum, 0);
+    atomic_store(&gSegRunStateMask, 0);
+    for (int i = 0; i < 8; i++) atomic_store(&gSegRunStateHist[i], 0);
 }
 
 #pragma mark - 看门狗主循环
@@ -650,19 +837,38 @@ static void SLFWatchdogTick(void) {
     // 每个 tick 都采，与是否抓栈无关 —— 这是"繁忙 vs 卡死"判定的唯一数据来源。
     uint64_t cpuNow = 0;
     int runState = SLFMainThreadRunState(&cpuNow);
+
+    // run_state 只记录、不判定。它到底是 RUNNING 还是恒为 WAITING，
+    // 由下一轮日志的分布统计回答，不靠我猜。
+    if (runState >= 0 && runState < 8) {
+        atomic_store(&gSegRunStateMask,
+                     atomic_load(&gSegRunStateMask) | (1u << (unsigned)runState));
+        atomic_store(&gSegRunStateHist[runState],
+                     atomic_load(&gSegRunStateHist[runState]) + 1);
+    }
+
     uint64_t cpuPrev = atomic_load(&gLastMainCPUms);
     atomic_store(&gLastMainCPUms, cpuNow);
     // cpuPrev==0 说明是首次采样，无法算增量，跳过本次判定。
-    if (cpuPrev != 0 && cpuNow >= cpuPrev) {
+    if (cpuPrev != 0 && cpuNow >= cpuPrev && deltaMS > 0) {
         uint64_t cpuDelta = cpuNow - cpuPrev;
-        if (runState == TH_STATE_RUNNING &&
-            cpuDelta + 5 >= deltaMS / 2) {
-            // 状态是"运行中"，且这一拍里消耗了可观 CPU → 确实在干活。
+        // 主判据：CPU 时间增量占墙钟增量的比例。
+        // 单线程的 CPU 时间不可能超过墙钟，但计数器取整可能略超，故钳到 1。
+        double ratio = (double)cpuDelta / (double)deltaMS;
+        if (ratio > 1.0) ratio = 1.0;
+
+        atomic_store(&gSegCPUusSum, atomic_load(&gSegCPUusSum) + cpuDelta * 1000ULL);
+        atomic_store(&gSegWallusSum, atomic_load(&gSegWallusSum) + (uint64_t)deltaMS * 1000ULL);
+
+        if (ratio >= 0.5) {
+            // 这一拍大半时间在烧 CPU → 主线程确实在推进。
             atomic_store(&gSegBusyTicks, atomic_load(&gSegBusyTicks) + 1);
-        } else if (runState == TH_STATE_WAITING ||
-                   runState == TH_STATE_UNINTERRUPTIBLE) {
-            // 状态是"等待"且 CPU 没怎么涨 → 真的卡在锁/IPC 上。
+        } else if (ratio <= 0.15) {
+            // 几乎没烧 CPU → 真的卡在锁 / IPC 上。
             atomic_store(&gSegWaitTicks, atomic_load(&gSegWaitTicks) + 1);
+        } else {
+            // 中间态：既在等也在跑（典型现象是循环里反复等一个锁）。
+            atomic_store(&gSegMixedTicks, atomic_load(&gSegMixedTicks) + 1);
         }
     }
 
@@ -769,15 +975,18 @@ static void SLFWatchdogTick(void) {
 // 用途一：把三个定时器引用真正"读"一次，避免 -Wunused-but-set-variable；
 // 用途二：这是有实际价值的自检 —— 定时器被释放后看门狗会静默失效，
 //         定期打印存活状态能在日志里直接看出"看门狗还活着吗"。
-// ★ 措辞注意：1.0.5 这里打印成 `tick=1 beat=1 stat=1`，看起来像"计数恒为 1"，
+// ★ 措辞注意（1.0.5 教训）：这里曾打印 `tick=1 beat=1 stat=1`，看起来像"计数恒为 1"，
 //   我读日志时差点据此判定"tick 只跑了一次"。实际打印的是"定时器是否存在"。
-//   带误导性的日志比没有日志更坏 —— 所以改成明确的 存活/失效。
+//   带误导性的日志比没有日志更坏 —— 所以改成明确的 存在/缺失。
+// ★ 编码注意（1.0.6 实测）：这里的「存在/缺失」原本是 C 字符串走 %s，
+//   -[NSString initWithFormat:] 的 %s 按 MacRoman 解释，中文变乱码。
+//   中文一律用 @"..." 配 %@。
 void SLFWatchdogHealthCheck(void) {
-    SLFLog(@"[watchdog] 存活自检：tick 定时器 %s，beat 定时器 %s，stat 定时器 %s；"
+    SLFLog(@"[watchdog] 存活自检：tick 定时器 %@，beat 定时器 %@，stat 定时器 %@；"
             "累计抓栈 %d 次",
-           gTickTimer != NULL ? "存在" : "缺失",
-           gBeatTimer != NULL ? "存在" : "缺失",
-           gStatTimer != NULL ? "存在" : "缺失",
+           gTickTimer != NULL ? @"存在" : @"缺失",
+           gBeatTimer != NULL ? @"存在" : @"缺失",
+           gStatTimer != NULL ? @"存在" : @"缺失",
            (int)atomic_load(&gReportCount));
 }
 
@@ -797,6 +1006,9 @@ static void SLFStartWatchdogOnce(void) {
 
     SLFTouchPort();
     SLFPumpBeat();
+    // 趁主线程还空闲时把 image 表建好：之后抓栈在后台线程，
+    // 那里不该做 calloc/qsort 这种可能阻塞的活。
+    SLFBuildImageTable();
 
     atomic_store(&gWatchdogRunning, true);
 

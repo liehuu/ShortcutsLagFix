@@ -178,26 +178,58 @@ jobs:
           grep -q 'StallMaxCapturesPerSegment' ShortcutsLagFix/SLFWatchdog.m \
             || { echo "::error::缺少单段抓栈上限 StallMaxCapturesPerSegment"; exit 1; }
 
-          # 10) ★ 偏移必须用「base 高位 + 目标低位」重建。
-          #     实测问题：1.0.5 用"右截 40/32 位"去猜 PAC，截完的值必然小于 image 基址，
-          #     全部不满足 → 663 帧污染值被原样输出。
-          grep -q 'SLFRealignToBase' ShortcutsLagFix/SLFWatchdog.m \
-            || { echo "::error::缺少 SLFRealignToBase：PAC 污染的偏移无法重建"; exit 1; }
+          # 10) ★ 偏移归属必须由 dyld image 表决定。
+          #     实测两连败：1.0.4 用 dli_saddr 相减（PAC 残留，负数），
+          #     1.0.5 用"右截 40/32 位"猜 PAC（截完必然小于 image 基址，全部不满足），
+          #     两版都产出 663 帧不可符号化的偏移。
+          #     根因是同一个：**一旦地址被污染，就没有可靠办法判断哪些位可信**。
+          #     现在的做法是彻底不问这个问题，改问"它落在哪个 image 里"。
+          for sym in SLFBuildImageTable _dyld_get_image_header ptrauth_strip; do
+            grep -q "$sym" ShortcutsLagFix/SLFWatchdog.m               || { echo "::error::缺少 $sym：偏移归属必须由 dyld image 表 + ptrauth 剥离决定"; exit 1; }
+          done
+          if grep -nE 'SLFRealignToBase' ShortcutsLagFix/*.m ; then
+            echo "::error::检测到 SLFRealignToBase：猜位重建已被证明不可靠，禁止复活"
+            exit 1
+          fi
 
-          # 11) ★ 必须保留「繁忙 vs 卡死」判据。
+          # 11) ★ 必须保留「在执行 vs 卡在等待」判据。
           #     心跳是 dispatch_async(main_queue)，结构上无法区分
           #     "主线程卡死" 与 "主队列积压"，两者都会让心跳停住。
-          #     实测 21.89 秒的段其实是繁忙（PC 在变），差点被我误判成死锁。
-          grep -q 'THREAD_BASIC_INFO' ShortcutsLagFix/SLFWatchdog.m \
-            || { echo "::error::缺少 thread_info run_state 判据，无法区分繁忙与卡死"; exit 1; }
-          grep -q '主队列繁忙' ShortcutsLagFix/SLFWatchdog.m \
-            || { echo "::error::段结算缺少「主队列繁忙」结论输出"; exit 1; }
+          #     而 run_state 实测在 66 次采样里全报 WAITING，
+          #     与 PC 持续变化的事实矛盾 —— 它不能当判据，只能当观测项。
+          grep -q 'THREAD_BASIC_INFO' ShortcutsLagFix/SLFWatchdog.m             || { echo "::error::缺少 thread_info 观测（run_state 原始值）"; exit 1; }
+          grep -q 'gSegCPUusSum' ShortcutsLagFix/SLFWatchdog.m             || { echo "::error::缺少 CPU 增量判据（gSegCPUusSum）：run_state 不可信，必须用 CPU 时间做主判据"; exit 1; }
+          grep -q '本段平均 CPU 占用率' ShortcutsLagFix/SLFWatchdog.m             || { echo "::error::段结算缺少 CPU 占用率输出"; exit 1; }
+          grep -q '本段 run_state 原始值' ShortcutsLagFix/SLFWatchdog.m             || { echo "::error::缺少 run_state 原始分布自证行"; exit 1; }
 
           # 12) postinst 必须预置两个新键，否则用户无法调段内抽稀。
           for k in StallResampleMS StallMaxCapturesPerSegment; do
-            grep -q "$k" layout/DEBIAN/postinst \
-              || { echo "::error::postinst 内嵌配置缺 $k"; exit 1; }
+            grep -q "$k" layout/DEBIAN/postinst               || { echo "::error::postinst 内嵌配置缺 $k"; exit 1; }
           done
+
+          # 13) ★ 中文字面量不得走 %s。
+          #     实测事故（1.0.6 日志）：诊断结论行用 %s 传中文，
+          #     而 -[NSString initWithFormat:] 的 %s 按 MacRoman 解释字节，
+          #     「在持续变化」变成「Âú®ÊÅÁª≠ÂèòÂåñ」、「存在」变成「Â≠òÂú®」。
+          #     乱码的正是最需要读的两行结论 —— 工具在最关键处自毁可读性。
+          #     判据：这两处必须是完整的 @"..." 字面量（含前导 @ 与结尾引号），
+          #     而不是裸 "..."。用整串精确匹配，避免"匹配到注释里的同名词"这种假通过。
+          # 判据分两步：先确认这段中文存在，再确认它所在行带 @" 前导。
+          # 直接 grep 完整字面量容易被中间的箭头/空格绊倒（第一版就栽在这）。
+          hit="$(grep -nF 'PC 在持续变化，倾向在推进' ShortcutsLagFix/SLFWatchdog.m || true)"
+          if [ -z "$hit" ]; then
+            echo "::error::找不到「PC 在持续变化」结论行（是不是被删了？）"
+            exit 1
+          fi
+          if ! printf '%s' "$hit" | grep -qF '@"'; then
+            echo "::error::「PC 在持续变化」必须写成 @\"...\" 形态，不能走 %s（会按 MacRoman 变乱码）"
+            echo "命中行：$hit"
+            exit 1
+          fi
+          if ! grep -qF '@"存在" : @"缺失"' ShortcutsLagFix/SLFWatchdog.m ; then
+            echo "::error::「存在/缺失」必须写成 @\"...\" 形态，不能走 %s（会按 MacRoman 变乱码）"
+            exit 1
+          fi
 
           echo "版本与预热守卫通过"
 

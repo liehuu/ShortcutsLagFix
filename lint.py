@@ -132,20 +132,51 @@ def check_format(f, lines):
 
 
 # ---------- [3] 隐式声明 ----------
-# 注意：这里出现的返回类型必须覆盖项目里实际用到的全部类型。
-# 曾经漏掉 const char（SLFImageNameAndOffset 被误判未声明）、
-# 现在又漏掉 dispatch_queue_t（SLFWatchdogQueue 被误判未声明）。
-# 规则：新增任何非 void/BOOL 返回类型的 static 函数时，同步补这个正则。
-_DECL_PAT = re.compile(
-    r'\b(?:void|BOOL|int|NSInteger|uint64_t|const\s+char|NSString'
-    r'|dispatch_queue_t|dispatch_source_t|IMP)\s*\*?\s*(SLF\w+)\s*\(')
+# ★ 这里原本是一张返回类型白名单，实测已经连错四次：
+#     const char（SLFImageNameAndOffset）、dispatch_queue_t（SLFWatchdogQueue）、
+#     int（SLFMainThreadRunState）、const SLFImageEntry *（SLFFindImage）。
+#   每次都是同一个模式：新增一个函数 → 返回类型不在表里 → 定义不被收录
+#   → 调用点被判"未声明" → 一堆假错误把真问题淹没。
+#
+#   → 根治：不再枚举返回类型，改看**结构**。
+#     一个"声明/定义"行的结构特征：函数名前**至少有一个类型词**。
+#     而一行调用（`SLFFoo();` 或 `return SLFFoo();`）在函数名前
+#     只有空白、或者只有 return/运算符/括号。
+#
+#   ⚠️ 第一版改用 `^\s*[^(){};=]*?\b(SLF\w+)\s*\(` 时踩了坑：
+#     这个正则允许前缀为空，于是 `SLFNoSuchFunction(1, 2);` 这种调用
+#     也被当成了"声明" —— 守卫从此永远通过，等于被删掉。
+#     放宽守卫以消除误报，代价是守卫变成摆设。这次改成先取前缀再判定，
+#     前缀里有运算符/括号/return 等关键字的一律不算声明。
+_DECL_FUNC_PAT = re.compile(r'\b(SLF\w+)\s*\(')
+_DECL_MODIFIERS = re.compile(
+    r'\b(?:static|extern|inline|const|struct|enum|union|__unused|__attribute__\S*)\b')
+_DECL_NEGATIVE = re.compile(
+    r'[=(,?:]|\b(?:return|if|else|while|for|switch|case|do|sizeof|goto)\b')
+
+
+def _decl_name_on_line(line):
+    """若该行是 SLF 函数的声明或定义，返回函数名；否则返回 None。"""
+    m = _DECL_FUNC_PAT.search(line)
+    if not m:
+        return None
+    prefix = line[:m.start()]
+    # 调用点特征：前缀里出现运算符、括号或控制关键字 → 不是声明
+    if _DECL_NEGATIVE.search(prefix):
+        return None
+    # 去掉修饰词与指针星号后，必须还剩至少一个类型词
+    stripped = _DECL_MODIFIERS.sub(' ', prefix).replace('*', ' ').strip()
+    if stripped == '':
+        return None
+    return m.group(1)
 
 
 def _collect_decls(lines):
     declared = set()
     for ln in lines:
-        for m in _DECL_PAT.finditer(ln):
-            declared.add(m.group(1))
+        n = _decl_name_on_line(ln)
+        if n is not None:
+            declared.add(n)
     return declared
 
 
@@ -506,6 +537,64 @@ def check_test_isolation():
             "[18] 测试脚本改写了生产 layout/ 却未重定向到临时目录（会删真实文件）")
 
 
+# ---------- [20] 交给 ObjC 格式化的中文字面量必须用 @"..." ----------
+# 真实事故（1.0.6 日志）：诊断结论行写成
+#   SLFLogAlways(@"[stall] ...重复率 %.0f%%（%d/%d）%s", ..., 
+#                sameRatio >= 0.8 ? " ← 几乎停在同一条指令上" : " ← PC 在持续变化");
+# 而 -[NSString initWithFormat:] 的 %s 按 **MacRoman** 解释字节，不是 UTF-8。
+# 「在持续变化」于是变成「Âú®ÊÅÁª≠ÂèòÂåñ」，「存在」变成「Â≠òÂú®」。
+# 荒谬的是：乱码的正好是我最需要读的两行结论 —— 工具在最关键处自毁可读性。
+#
+# 判据：**同一条语句里既有 %s 又有中文 C 字符串字面量**。
+#
+# 缺陷的形状就长这样（1.0.6 实测）：
+#     SLFLogAlways(@"[stall] ...%.0f%%（%d/%d）%s", ...,
+#                   cond ? " ← 中文A" : " ← 中文B");
+# 中文 C 字符串被 %s 取用 → 按 MacRoman 解释 → 乱码。
+#
+# 为什么不用"含中文的 C 字符串一律禁止"：
+#   ObjC 允许 @"abc" 后面紧跟 "def" 做跨行拼接，那些行的 "..." 完全合法；
+#   而且 C 层 fprintf/snprintf 里放中文是正确的（直接写 UTF-8 字节）。
+#   按"这一行有没有合法用途"一刀切会大面积误报（实测一次报了 16 条假错），
+#   误报一多就只能把守卫关掉 —— 那等于没有守卫。
+#   → 按**语句**看，并且只在真的出现 %s 时才判 —— 这才是缺陷的充分特征。
+_C_CSTR_PAT = re.compile(r'(?<![@\w])"((?:[^"\\]|\\.)*)"')
+_C_FMT_PAT = re.compile(r'\b(?:fprintf|snprintf|printf|vfprintf|asprintf)\s*\(')
+
+
+def _check_one_statement(f, start_line, stmt_lines):
+    code = "\n".join(l.split("//")[0] for l in stmt_lines)
+    if _C_FMT_PAT.search(code):
+        return                            # C 层打印，UTF-8 原样输出，没问题
+    if "%s" not in code and "%S" not in code:
+        return                            # 没有 %s，中文字面量走的是 %@，安全
+    for m in _C_CSTR_PAT.finditer(code):
+        lit = m.group(1)
+        if any(ord(ch) > 127 for ch in lit):
+            # 用字符串拼接而不是 % 运算符：消息里本来就带 %s / %@ 字样，
+            # 走 % 会把它们当占位符（实测输出成了 %%s / %%@，自己先乱了一次）。
+            err(f, start_line,
+                "[20] 这条语句用 %s 传了中文文本，ObjC 会按 MacRoman 解释而乱码"
+                "（实测「存在」→「Â≠òÂú®」）；应改成 %@ 配 @\"...\"。命中片段："
+                + lit[:26])
+            return
+
+
+def check_cstring_chinese(f, lines):
+    """按语句切分后逐条检查。以行尾的 ; / ); / ) { 作为语句边界。"""
+    buf, start = [], 0
+    for i, ln in enumerate(lines, 1):
+        if not buf:
+            start = i
+        buf.append(ln)
+        st = ln.rstrip()
+        if st.endswith(";") or st.endswith(") {") or st.endswith(");"):
+            _check_one_statement(f, start, buf)
+            buf = []
+    if buf:
+        _check_one_statement(f, start, buf)
+
+
 # ---------- [19] 文档/脚本里的包版本号必须等于 control ----------
 def check_version_refs():
     """README 等文档里出现的包文件名版本，必须与 control 的 Version 一致。
@@ -571,6 +660,7 @@ def main():
         check_constructor(f, lines)
         check_ios_headers(f, lines)
         check_set_but_unused(f, lines)
+        check_cstring_chinese(f, lines)
 
     check_test_isolation()
     check_version_refs()

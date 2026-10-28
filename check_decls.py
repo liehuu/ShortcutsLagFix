@@ -46,25 +46,28 @@ def main():
     # static 定义
     defined = {}
     #
-    # ret_types 必须覆盖项目里实际用到的所有返回类型。
-    # 漏一个的后果不是"漏报"，而是**误报**：定义没被收录 → 调用点被判成
-    # "未声明的函数"，于是一堆假错误把所有真问题淹没。
-    # 实测：这里原先没有 "const char"，SLFImageNameAndOffset 因此被误报 3 次。
-    # 后来又漏了 "int"（SLFMainThreadRunState 返回 int），同样被误报。
-    # 规律很清楚：**每新增一个返回类型，就必须同步这张表**，
-    # 否则检查器会开始骗人 —— 它报的不是代码的问题，是自己的见识不够。
-    ret_types = (r"void|BOOL|int|NSInteger|uint64_t|NSString|IMP|dispatch_source_t"
-                 r"|dispatch_queue_t|const\s+char")
+    # ★ 这里原本是一张 ret_types 白名单，实测已经连错三次：
+    #     第一次漏 "const char"  → SLFImageNameAndOffset 被误报 3 次；
+    #     第二次漏 "int"         → SLFMainThreadRunState 被误报；
+    #     第三次漏 "const SLFImageEntry *" → SLFFindImage 被误报 6 次。
+    #   规律很清楚：**枚举"合法的返回类型"注定漏**，因为类型可以带 const、
+    #   可以带指针、可以是项目自定义的 struct。每加一个函数就要同步这张表，
+    #   而忘了同步的代价是检查器开始骗人 —— 它报的不是代码的问题，是自己的见识不够。
+    #
+    #   → 改用**结构特征**判定，不再看返回类型叫什么：
+    #     行首 static（可带 __attribute__ 修饰），
+    #     函数名是紧邻第一个 `(` 之前的那个 SLF 标识符，
+    #     中间的类型片段允许 const / 指针 / 自定义 struct / 空格。
+    #     这样无论返回类型怎么变都不会漏。
     for f in sorted(glob.glob(os.path.join(SRC, "*.m"))):
         body = strip_comments(open(f, encoding="utf-8").read())
         for m in re.finditer(
-                r"^static\s+(?:__attribute__\S+\s+)?"
-                r"(%s)\s*\*?\s*(SLF\w+)\s*\(([^;{]*)\)\s*\{" % ret_types,
+                r"^static\s+[^(){};]*?(SLF\w+)\s*\(([^;{]*)\)\s*\{",
                 body, re.M):
-            ret, name, args = m.group(1), m.group(2), m.group(3)
+            name, args = m.group(1), m.group(2)
             nargs = 0 if args.strip() in ("", "void") else len(
                 [a for a in split_args(args)])
-            defined[name] = (os.path.basename(f), ret.strip(), nargs)
+            defined[name] = (os.path.basename(f), "?", nargs)
 
     print("头文件原型 (%d):" % len(protos))
     for k in sorted(protos):

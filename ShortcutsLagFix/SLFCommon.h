@@ -83,6 +83,13 @@ BOOL SLFMainThreadResponsive(void);
 /// 输出各 hook 的耗时统计（由看门狗定时调用）。
 void SLFDumpStats(void);
 
+/// 建立"已加载 image 表"（dyld 报的基址），供栈帧归属判定使用。
+/// 必须在主线程、早于第一次抓栈调用；重复调用无副作用（幂等）。
+/// ★ 为什么需要它：从栈内存读出的返回地址带 PAC 签名，而签名位落在
+///   48 位地址之内，任何掩码都剥不干净。改用"最大 base ≤ addr"定归属，
+///   再以 addr - base 算偏移 —— 只依赖 dyld 给的干净基址，不猜哪些位可信。
+void SLFBuildImageTable(void);
+
 /// 宿主是否为本插件目标 App（防御性检查，避免注入出错 App）。
 BOOL SLFIsTargetApp(void);
 
