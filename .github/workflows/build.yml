@@ -166,6 +166,39 @@ jobs:
             exit 1
           fi
 
+          # 9) ★ 段内抽稀必须存在。
+          #    实测事故：1.0.5 的注释写着"同一段只抓一次"，代码里没实现，
+          #    40 次配额在 9.8 秒内被同一段烧光，导致 21.89s / 5.20s / 3.17s
+          #    三段一条栈都没有 —— 工具在最该记录的地方失明。
+          #    判据：抽稀要用到 gSegLastCaptureNS，且间隔来自 StallResampleMS。
+          grep -q 'gSegLastCaptureNS' ShortcutsLagFix/SLFWatchdog.m \
+            || { echo "::error::缺少段内抽稀（gSegLastCaptureNS）：同一段的重复上报会烧光抓栈配额"; exit 1; }
+          grep -q 'StallResampleMS' ShortcutsLagFix/SLFWatchdog.m \
+            || { echo "::error::缺少 StallResampleMS 配置项"; exit 1; }
+          grep -q 'StallMaxCapturesPerSegment' ShortcutsLagFix/SLFWatchdog.m \
+            || { echo "::error::缺少单段抓栈上限 StallMaxCapturesPerSegment"; exit 1; }
+
+          # 10) ★ 偏移必须用「base 高位 + 目标低位」重建。
+          #     实测问题：1.0.5 用"右截 40/32 位"去猜 PAC，截完的值必然小于 image 基址，
+          #     全部不满足 → 663 帧污染值被原样输出。
+          grep -q 'SLFRealignToBase' ShortcutsLagFix/SLFWatchdog.m \
+            || { echo "::error::缺少 SLFRealignToBase：PAC 污染的偏移无法重建"; exit 1; }
+
+          # 11) ★ 必须保留「繁忙 vs 卡死」判据。
+          #     心跳是 dispatch_async(main_queue)，结构上无法区分
+          #     "主线程卡死" 与 "主队列积压"，两者都会让心跳停住。
+          #     实测 21.89 秒的段其实是繁忙（PC 在变），差点被我误判成死锁。
+          grep -q 'THREAD_BASIC_INFO' ShortcutsLagFix/SLFWatchdog.m \
+            || { echo "::error::缺少 thread_info run_state 判据，无法区分繁忙与卡死"; exit 1; }
+          grep -q '主队列繁忙' ShortcutsLagFix/SLFWatchdog.m \
+            || { echo "::error::段结算缺少「主队列繁忙」结论输出"; exit 1; }
+
+          # 12) postinst 必须预置两个新键，否则用户无法调段内抽稀。
+          for k in StallResampleMS StallMaxCapturesPerSegment; do
+            grep -q "$k" layout/DEBIAN/postinst \
+              || { echo "::error::postinst 内嵌配置缺 $k"; exit 1; }
+          done
+
           echo "版本与预热守卫通过"
 
 

@@ -50,7 +50,10 @@ def main():
     # 漏一个的后果不是"漏报"，而是**误报**：定义没被收录 → 调用点被判成
     # "未声明的函数"，于是一堆假错误把所有真问题淹没。
     # 实测：这里原先没有 "const char"，SLFImageNameAndOffset 因此被误报 3 次。
-    ret_types = (r"void|BOOL|NSInteger|uint64_t|NSString|IMP|dispatch_source_t"
+    # 后来又漏了 "int"（SLFMainThreadRunState 返回 int），同样被误报。
+    # 规律很清楚：**每新增一个返回类型，就必须同步这张表**，
+    # 否则检查器会开始骗人 —— 它报的不是代码的问题，是自己的见识不够。
+    ret_types = (r"void|BOOL|int|NSInteger|uint64_t|NSString|IMP|dispatch_source_t"
                  r"|dispatch_queue_t|const\s+char")
     for f in sorted(glob.glob(os.path.join(SRC, "*.m"))):
         body = strip_comments(open(f, encoding="utf-8").read())

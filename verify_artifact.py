@@ -214,7 +214,8 @@ def main(deb_path):
             bad("postinst 未对日志目录 chown，App 仍写不进日志")
         # 预置配置现在由 postinst 写入（属主 mobile，App 与用户都能改）。
         expected = ["DebugLog", "WatchdogEnabled", "StallThresholdMS",
-                    "MaxStallReports", "StatDumpInterval",
+                    "MaxStallReports", "StallResampleMS",
+                    "StallMaxCapturesPerSegment", "StatDumpInterval",
                     "OptDisableImplicitAnimations",
                     "WarmupEnabled", "WarmupDelayMS",
                     "WarmupLanguage", "WarmupStepTimeoutMS",
@@ -360,6 +361,13 @@ def main(deb_path):
         "系统一次性初始化",             # 阻塞类型自动分类
         "主队列拥塞",                   # 断链时的判定分支
         "补采热点",                     # 断链多采样聚合
+        # ★ v1.0.6 新增：确认「繁忙 vs 卡死」判据与段内抽稀真的进了二进制。
+        "主队列繁忙",                   # 段结算里的结论行
+        "主线程真卡在等待上",            # 同上，等待分支
+        "本段 PC 重复率",               # PC 稳定性统计
+        "偏移不可用",                   # 偏移重建失败时的诚实输出
+        "存活自检",                     # 取代有歧义的 tick=1
+        "UI 布局/绘制循环",             # 新增的分类分支
     ]
     probes_ascii = [
         b"com.apple.shortcuts",

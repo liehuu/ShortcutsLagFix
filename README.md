@@ -37,7 +37,7 @@ Dopamine-roothide / Bootstrap 环境上，**不需要**再用 roothide Patcher �
 
 ```bash
 # 方式一：直接安装（在设备上，用 Sileo / Zebra / 命令行均可）
-dpkg -i shortcutslagfix_1.0.5_iphoneos-arm64e.deb
+dpkg -i shortcutslagfix_1.0.6_iphoneos-arm64e.deb
 killall -9 Shortcuts
 
 # 方式二：本地编译（需要 macOS + Xcode）
@@ -142,30 +142,40 @@ find /var/mobile/Containers/Data/Application -name "ShortcutsLagFix.log" 2>/dev/
     类型: 等待（锁 / 条件变量 / 跨进程消息）
     本段: 自 1.53s 前起，这是同一段阻塞的第 5 次上报（勿累加，段总长请看下面的「上一段结束」行）
     主线程 PC=0x1db2f8b7c
-    #0  libsystem_kernel.dylib     __psynch_cvwait+0x8
-    #1  Foundation                 0x1c8a30
-    #2  UIKitCore                  0x8c1a4
+    #0  libsystem_kernel.dylib    0x1c58         near __psynch_cvwait
+    #1  Foundation                0x1c8a30
+    #2  UIKitCore                 0x8c1a4
     ...
 ```
 
 - **`[stall]`** —— 卡顿现场。栈顶几帧就是元凶。
-- **`类型:`** —— 插件自动归类，直接告诉你这是「等待」「系统一次性初始化」
-  「视图图求值」还是「主队列拥塞」。33 次栈共约 300 行，人肉读极容易看错。
+- **`类型:`** —— 插件自动归类：`等待（锁 / IPC）`、`系统一次性初始化`、`视图图求值`、
+  `UI 布局/绘制循环`、`主队列拥塞`。数百行栈人肉读极容易看错。
 - **`本段:` / `上一段结束`** —— ⚠️ **同一段持续阻塞会每 100ms 上报一次，毫秒数绝不能累加。**
   实测某次日志里 5 次上报分别写着 969 / 1304 / 1333 / 1433 / 1533ms，
   加起来 6572ms，而该段真实长度只有 **1.69 秒**，虚报近 4 倍。
   真实总长只看 `[stall] 上一段结束：持续 X.XXs`。
-- **`--- 补采热点 ---`** —— 栈断链（帧数太少）时自动隔 10ms 连采 8 次并聚合，
-  给出命中最多的地址。断链的栈本来没有任何信息量，这一步把它救回来。
+- **`上一段结束` 后面的三行判据（v1.0.6 新增）** —— 这是最重要的部分：
+  - `本段主线程状态：执行中 X 次 / 等待中 Y 次 → 主队列繁忙 / 真卡在等待上`
+    「繁忙」表示主线程在持续干活，只是心跳 block 排不上队；
+    「真卡在等待上」才是 hang。**两者修法完全不同。**
+  - `本段 PC 重复率` —— 接近 100% 说明停在同一条指令上（单点卡死）；
+    偏低说明 PC 一直在变（在推进）。
+  - `本段抓栈 N 次` —— 确认段内抽稀生效，配额没被一段吃光。
+- **`偏移不可用 raw=0x…`** —— 该帧地址被 PAC 污染且无法重建。
+  插件宁可明说不可用也不给假偏移；`raw` 就是排查依据。
+- **`--- 补采热点 ---`** —— 栈断链（帧数太少）时自动隔 10ms 连采 8 次并聚合。
 - **`[slow]`** —— 单个方法耗时超阈值。
 - **`[vc]`** —— 初始化较慢的界面类名。
-- **`[warmup]`** —— 预热各步耗时。这些成本已提前在后台付掉，不会再算到点击上。
+- **`[warmup]`** —— 预热各步耗时。默认关闭，只有手动打开才有输出。
+- **`[watchdog] 存活自检`** —— 三个定时器是否还在（v1.0.6 起措辞明确；
+  旧版打印的 `tick=1 beat=1` 是"存在"而不是"跑了一次"，极易误读）。
 - **`[stat]`** —— 每 `StatDumpInterval` 秒输出统计。注意 `viewDidLoad` /
   `viewDidAppear` 的 `avg=0.00ms` **属正常**：只 hook 了基类空实现，
   覆写了它的子类调用不经过插件，这两个数字只能用来看 hook 是否活着。
 - **`[hook]`** —— 每个 hook 的安装结果。若是 `SKIP`，说明该方法不在目标类自身的方法表里。
 
-## 实测诊断结论（截至 v1.0.5）
+## 实测诊断结论（截至 v1.0.6）
 
 设备：iPhone12,3 / iOS 17.0.3。以下全部来自真实日志，每一条都能在日志里指到行。
 
@@ -195,9 +205,103 @@ find /var/mobile/Containers/Data/Application -name "ShortcutsLagFix.log" 2>/dev/
 3. 看门狗有 **12 秒观测盲区**；
 4. 40 次上报上限被撞满后，**之后完全静音**。
 
+### 第三次实测（v1.0.5，75 秒窗口）—— 最重要的新结论
+
+**47.50 秒不可用（16 段），单段最长 21.89 秒，期间上报 204 次。**
+
+先把数字口径摆清楚：40 条上报的毫秒数若直接相加得 **88.84 秒**，而按区间求并集是
+**47.50 秒**，虚报 87%。这就是为什么要坚持"同一段只算一次"。
+
+| 段结束时刻 | 时长 | 上报次数 |
+|---|---|---|
+| 13:50:39.039 | **21.89s** | 204 |
+| 13:50:45.240 | **5.20s** | 49 |
+| 13:51:15.239 | 3.17s | 30 |
+| 13:51:18.336 | 3.07s | 29 |
+| 13:51:09.856 | 2.53s | 20 |
+| 其余 11 段 | 0.47~2.01s | — |
+
+#### ★ 那 21.89 秒不是死锁，是主队列繁忙
+
+这是本项目第一次能**明确否定**"主线程死锁"这个假设。证据是同一条段内、主线程 PC 在变：
+
+```
+13:50:19.567（段内第 2.26s）  主线程 PC=0x18cb188b8 → objc_msgSend
+   #1~#38  全是 UIKitCore（布局/绘制链）
+   #43 CoreFoundation  near CFRunLoopRunSpecific
+   #44 GraphicsServices near GSEventRunModal
+   #46 UIKitCore       near UIApplicationMain
+
+13:50:20.942（段内第 3.88s）  主线程 PC=0x1db2f8b7c → __psynch_cvwait
+   #1~#2 Foundation（等条件变量）
+   #3~#24 UIKitCore
+   #30 CoreFoundation  near CFRunLoopRunSpecific
+```
+
+同一个"段"里，主线程一会儿在 `objc_msgSend` 发消息、一会儿在 `__psynch_cvwait` 等锁，
+栈始终挂在 `UIApplicationMain → CFRunLoop → UIKit 布局` 这一条合法的运行路径上。
+**它在干活，不是卡在一个点上。**
+
+这也解释了为什么"阻塞 21.89 秒"App 却没被系统杀掉 —— 它没有被阻塞，只是主队列上排了
+大量 block（SwiftUI 更新、CoreData 变更通知、UIKit 布局），我那个
+`dispatch_async(main_queue)` 的心跳 block 只能排在队尾。
+
+⚠️ 这一点是 **v1.0.6 才敢下的结论**：心跳机制从结构上无法区分
+"主线程卡死"与"主队列积压"，两者都会让心跳停住。所以 v1.0.6 增加了独立判据（见下）。
+
+#### v1.0.6 新增的判据：run_state + CPU + PC 重复率
+
+| 判据 | 含义 |
+|---|---|
+| `TH_STATE_RUNNING` 且累计 CPU 在涨 | 主线程在执行代码（忙，但没死） |
+| `TH_STATE_WAITING` / `UNINTERRUPTIBLE` 且 CPU 不涨 | 真的卡在锁 / IPC 上（hang） |
+| PC 重复率 ≥ 80% | 几乎停在同一条指令 → 倾向单点卡死 |
+| PC 重复率 < 80% | PC 在持续变化 → 倾向在推进 |
+
+段结算时直接输出结论，例如：
+
+```
+[stall] 上一段结束：持续 21.89s，期间上报 204 次……
+[stall]   本段主线程状态：执行中 18 次 / 等待中 4 次（共采样 22 次）→ 主队列繁忙……
+[stall]   本段 PC 重复率 14%（3/22） ← PC 在持续变化，倾向在推进
+[stall]   本段抓栈 12 次（已按 StallResampleMS 抽稀……）
+```
+
+#### ⚠ 配额被同一段烧光（v1.0.6 修）
+
+v1.0.5 的注释写着"同一段卡顿只抓一次"，**代码里根本没实现**。
+实测 40 次配额在 **9.8 秒内**被同一段用光（第 7~40 次上报全是"同一段的第 2~34 次"），
+于是最该记录的 21.89s / 5.20s / 3.17s 三段**一条栈都没有**。
+
+v1.0.6：同一段内相邻抓栈间隔 ≥ `StallResampleMS`（默认 800ms），单段最多 12 次，
+配额只留给新段；总上限 40 → 60。这样一段再长也吃不掉配额。
+
+#### ⚠ 栈偏移"修好了"其实没修好（v1.0.6 才真修）
+
+v1.0.5 声称偏移已统一走 `addr - dli_fbase`，实测日志里仍然是：
+
+```
+#3  SwiftUI              0x81800072d258
+#5  libswiftCore.dylib   0x4d80003b2b90
+#6  SwiftUI              0x8e8000003c3c
+```
+
+统计下来 **663 帧**偏移 > 128MB，全部无法符号化（真实偏移应是 `0x72d258`、`0x3b2b90`、
+`0x3c3c` 这种量级）。
+
+根因：`fp` 链里读出的返回地址带 PAC，而 `SLF_STRIP` 的 48 位掩码**剥不掉**它 ——
+PAC 落在 bit 32~47，剥完仍在 48 位内，`a` 保持一副"合法"长相。
+v1.0.5 的回退逻辑用"右截 40 / 32 位"去猜，但截完的值必然远小于 image 基址
+（基址在 `0x1a8_xxxxxxxx` 一带），于是全部不满足，污染值被原样输出。
+
+v1.0.6 的做法：**用 base 的干净高位 + a 的可信低位重建**。
+依据是 image 内偏移一定远小于 1GB，低位必可信、高位一律取 base 的。
+重建失败时输出 `偏移不可用 raw=0x…` 并附原始地址 —— **绝不给一个看着像偏移的假值**，
+假证据比没有证据更糟。
+
 ### ✗ v1.0.4 的预热是负优化（v1.0.5 已关闭）
 
-这是本版本最重要的结论，也是我必须先认的错。日志时间线：
+这是本项目最重要的结论之一，也是我必须先认的错。日志时间线：
 
 ```
 13:27:34.287  [warmup] 开始
@@ -263,44 +367,24 @@ v1.0.0 第 1 次 stall 的栈里赫然是本插件：
 v1.0.4 已移到后台队列 + 每 1000 个类让出一次 runtime 锁（长时间持锁会让主线程的
 msgSend 慢路径等锁，等于把卡顿换个名字）。
 
-### ✓ 栈偏移量曾全部不可用（v1.0.5 已修）
-
-v1.0.4 日志里 UIKitCore / CoreUI / CoreFoundation 的每一帧长这样：
-
-```
-#0  UIKitCore      <redacted>+0x508000000750
-#2  libsystem_kernel.dylib  mach_msg+0x188000000018
-```
-
-高位是 PAC 签名残留，低位才是真实偏移（`0x750`、`0x18`）。这种数字喂不进 `atos`，
-整个栈等于白抓。
-
-根因：`SLFImageNameAndOffset` 注释写着"改用 image 基址"，代码却在
-`dli_saddr <= addr` 时把偏移**改回** `addr - dli_saddr`；而 `addr` 从栈上读出时可能带
-PAC 高位、`dli_saddr` 是已剥离的干净地址，两者相减就产出天文数字。
-
-v1.0.5 的铁律：**偏移量只有一个来源 —— `addr - dli_fbase`**，符号名只作提示。
-现在栈帧格式为：
-
-```
-#5  CoreFoundation  0x3a1b2c       near CFRunLoopRunSpecific
-#6  UIKitCore       0x8c1a4
-```
-
-可以直接 `atos -o UIKitCore -arch arm64e 0x8c1a4`。
-
 ### 明确修不了的部分（不假装能修）
 
-- **ImageIO 同步解压 3.13s**：App 渲染图库图标时同步解压整张图，未降采样。
+基于三轮实测（v1.0.3 / v1.0.4 / v1.0.5）共同出现的成分：
+
+- **UIKit 布局/绘制链本身**：v1.0.5 那 21.89 秒的段里，47 层栈几乎全是 UIKitCore，
+  底部是 `CFRunLoopRunSpecific → GSEventRunModal → UIApplicationMain`。
+  这是 App 在正常跑布局，插件要"降本"就必须跳过或合并布局，等于改写 App 的渲染逻辑。
+- **SwiftUI / AttributeGraph 视图图求值**：三轮都在，是 App 自身的 body 重算。
+- **ImageIO 同步解压**（v1.0.3 达 3.13s）：App 渲染图库图标时同步解压整张图，未降采样。
   拦截 `CGDataProviderCopyData` 或篡改返回的 CGImage 尺寸会破坏布局，风险远大于收益。
-- **SwiftUI / AttributeGraph**：14 段涉及视图图求值，最多的一段 3.1s。
-  这是 App 自身的 body 重算，不改变渲染结果就降不下来。
-- **FrontBoardServices 903ms**：主线程同步等 SpringBoard 的跨进程调用。
-- **AutoFillUI 触发的语言识别**：v1.0.4 日志里主线程在
-  `AutoFillUI → CFStringTokenizerCreate → CoreNLP` 上耗掉 4 秒。
-  那是系统在密码自动填充栏里做语言判断，插件没有安全手段让它异步化。
-- **FLEXing.dylib**：v1.0.3 日志里出现 5 段、涉及 4.45s。
-  v1.0.4 日志里已不再出现，说明你已关掉 —— 请保持关闭状态再测，否则数据会混。
+- **FrontBoardServices 跨进程 IPC**（903ms）：主线程同步等 SpringBoard。
+- **AutoFillUI 触发的语言识别**（v1.0.4 达 4 秒）：栈为
+  `AutoFillUI → CFStringTokenizerCreate → CoreNLP`。系统在密码自动填充栏里做语言判断，
+  插件没有安全手段让它异步化 —— 而且**任何"预热"尝试都会反过来争同一把锁**（已实测）。
+- **FLEXing.dylib**：v1.0.3 出现在 5 段、涉及 4.45s。v1.0.4 起不再出现，请保持关闭。
+
+结论要说透：**这个卡顿的主体是 App 自己的主队列工作量，不是某个可以被 hook 掉的 bug。**
+插件能做的只有三件事 —— 精确测出来、不自己添乱、把能安全移走的移走。
 
 ## 配置
 
@@ -316,6 +400,8 @@ v1.0.5 的铁律：**偏移量只有一个来源 —— `addr - dli_fbase`**，�
 | `WatchdogEnabled` | bool | `true` | 卡顿看门狗 |
 | `StallThresholdMS` | int | `250` | 判定卡顿的阻塞时长阈值 |
 | `MaxStallReports` | int | `60` | 最多抓栈次数（超限后仍继续统计段，只是不再打印栈） |
+| `StallResampleMS` | int | `800` | 同一段内相邻两次抓栈的最小间隔（v1.0.6 新增） |
+| `StallMaxCapturesPerSegment` | int | `12` | 单段最多抓栈次数，防止一段吃光配额（v1.0.6 新增） |
 | `StatDumpInterval` | int | `30` | 统计输出间隔（秒），0 = 关闭 |
 | `OptDisableImplicitAnimations` | bool | `true` | reload 期间关闭隐式动画 |
 | `WarmupEnabled` | bool | **`false`** | 后台预热（v1.0.5 改为默认关闭，见上文反证） |
