@@ -132,6 +132,7 @@ def main():
         print("运行成功但没有产物")
         return 3
 
+    got_deb = 0
     for a in arts:
         if a.get("expired"):
             print("产物已过期: %s" % a["name"])
@@ -144,7 +145,6 @@ def main():
             print("下载失败: %s" % exc)
             return 4
 
-        n = 0
         with zipfile.ZipFile(out) as z:
             for m in z.namelist():
                 if m.endswith(".deb"):
@@ -153,7 +153,7 @@ def main():
                     with open(dst, "wb") as fh:
                         fh.write(data)
                     print("已下载 %s (%d bytes)" % (os.path.basename(m), len(data)))
-                    n += 1
+                    got_deb += 1
                 elif m.endswith(".txt") or m.endswith(".log"):
                     # 构建日志/校验报告一并落盘，便于事后核对
                     txt = z.read(m).decode("utf-8", "replace")
@@ -163,13 +163,13 @@ def main():
                             fh.write(txt)
                         print("  附带报告: %s" % name)
         os.remove(out)
-        try:
-            os.remove(cfg)
-        except OSError:
-            pass
-        if n == 0:
-            print("压缩包里没有 .deb")
-            return 5
+
+    # 判断必须放在循环之外：CI 会上传两个 artifact（dylib 与 deb），
+    # 第一个是 dylib，若在循环内判断"本包没有 deb"就 return，
+    # 会漏掉后面真正装着 deb 的那个。
+    if got_deb == 0:
+        print("所有压缩包里都没有 .deb")
+        return 5
     return 0
 
 
