@@ -53,7 +53,8 @@ static void SLFMainThreadSetup(void) {
         SLFLogAlways(@"                  滞后大说明看门狗自己被打断过，那段时间是观测盲区。");
         SLFLogAlways(@"                  栈帧格式为「镜像名 0x偏移」，偏移相对该镜像基址，");
         SLFLogAlways(@"                  可直接 atos 符号化；near 后面只是最近导出符号，仅作参考。");
-        SLFLogAlways(@"                  若某帧真的算不出偏移，会明确写「偏移不可用 raw=0x…」");
+        SLFLogAlways(@"                  若某帧的地址落不进任何已加载镜像，会明确写"
+                      @"「无法解析 raw=0x…」并附原始地址 —— 绝不给假偏移。");
         SLFLogAlways(@"                  并附原始地址 —— 绝不给一个看着像偏移的假值。");
         SLFLogAlways(@"      [stall] 本段主线程状态 / PC 重复率 = v1.0.6 的关键判据：");
         SLFLogAlways(@"                  「主队列繁忙」= 主线程在干活，只是心跳排不上队；");

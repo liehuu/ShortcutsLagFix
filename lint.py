@@ -566,7 +566,13 @@ def _check_one_statement(f, start_line, stmt_lines):
     code = "\n".join(l.split("//")[0] for l in stmt_lines)
     if _C_FMT_PAT.search(code):
         return                            # C 层打印，UTF-8 原样输出，没问题
-    if "%s" not in code and "%S" not in code:
+    # ★ 这里不能用 `"%s" in code` 判断。
+    #   实测漏报：代码里写的是 `%-26s`（带宽度修饰符），不含字面 "%s"，
+    #   于是守卫放行了一个把中文打成乱码的包，CI 才在"探针字符串缺失"上炸出来。
+    #   %s 的合法形态有 %s / %-26s / %.10s / %*s / %S 等等，必须用正则认。
+    #   先删掉 %% 转义，避免把字面 "%s" 误判成占位符。
+    probe = code.replace("%%", "")
+    if not re.search(r"%[-+ 0#]*\d*(?:\.\d+)?[sS]", probe):
         return                            # 没有 %s，中文字面量走的是 %@，安全
     for m in _C_CSTR_PAT.finditer(code):
         lit = m.group(1)

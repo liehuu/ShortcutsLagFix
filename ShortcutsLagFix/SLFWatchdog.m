@@ -475,22 +475,27 @@ static NSString *SLFRenderStack(const SLFStackTrace *st) {
         uint64_t off = 0;
         const char *sym = NULL;
         const char *img = SLFImageNameAndOffset(st->addrs[i], &off, &sym);
+        // ★ 渲染层一律转成 NSString 再用 %@，格式串里不出现 %s。
+        //   理由（1.0.7 CI 实测）：这里原本用 %-26s 传 "<不属于任何 image>"，
+        //   而 %s 在 -[NSString initWithFormat:] 里按 MacRoman 解释字节 ——
+        //   中文会变乱码，且小写 s 带宽度修饰符（%-26s）很难被"有没有 %s"这类
+        //   简单检查发现。把 %s 从渲染层彻底清掉，这类坑就无处藏身。
         // 格式统一为「image + image 相对偏移」，可直接喂给：
         //   atos -o UIKitCore -arch arm64e 0x8c1a4
         // 符号名只跟在后面作参考（它是"最近的导出符号"，未必是真实函数）。
+        NSString *im = [NSString stringWithUTF8String:img];
+        NSString *sy = sym ? [NSString stringWithUTF8String:sym] : nil;
         if (off == SLF_OFF_UNUSABLE || strcmp(img, "?") == 0) {
             // 归属不明：把原始值打出来（这才是排查依据）。
             // 宁可明说"不可用"，也不输出一个看着像偏移的假值。
             // 1.0.6 日志里出现过 `#2  ?  0x0` 这种行 —— 既不知道是谁，也不是 0 偏移，
             // 打印成 0x0 会被人当成"偏移 0"，所以明确写成「无法解析」。
-            [sb appendFormat:@"    #%-2d %-26s 无法解析 raw=0x%llx\n",
-             i, "<不属于任何 image>", st->addrs[i]];
-        } else if (sym != NULL) {
-            // 格式统一为「image + image 相对偏移」，可直接喂给：
-            //   atos -o UIKitCore -arch arm64e 0x8c1a4
-            [sb appendFormat:@"    #%-2d %-26s 0x%-12llx near %s\n", i, img, off, sym];
+            [sb appendFormat:@"    #%-2d %-26@ 无法解析 raw=0x%llx\n",
+             i, @"<不属于任何 image>", st->addrs[i]];
+        } else if (sy != nil) {
+            [sb appendFormat:@"    #%-2d %-26@ 0x%-12llx near %@\n", i, im, off, sy];
         } else {
-            [sb appendFormat:@"    #%-2d %-26s 0x%llx\n", i, img, off];
+            [sb appendFormat:@"    #%-2d %-26@ 0x%llx\n", i, im, off];
         }
     }
     return sb;
@@ -592,14 +597,16 @@ static NSString *SLFSampleHotspots(mach_port_t thread, int rounds) {
             // 立刻格式化成 NSString：SLFImageNameAndOffset 返回的是静态缓冲区，
             // 下一次调用会覆盖它，不能保存指针。
             NSString *k;
+            NSString *im = [NSString stringWithUTF8String:img];
             if (off == SLF_OFF_UNUSABLE) {
                 // 归属不明时按原始地址聚合 —— 同一处反复出现的地址本身就是热点，
                 // 不能因为算不出偏移就把它丢掉（那等于把断链的栈又白采一遍）。
                 k = [NSString stringWithFormat:@"raw 0x%llx", st.addrs[i]];
             } else if (sym != NULL) {
-                k = [NSString stringWithFormat:@"%s %s+0x%llx", img, sym, off];
+                k = [NSString stringWithFormat:@"%@ %@+0x%llx", im,
+                     [NSString stringWithUTF8String:sym], off];
             } else {
-                k = [NSString stringWithFormat:@"%s 0x%llx", img, off];
+                k = [NSString stringWithFormat:@"%@ 0x%llx", im, off];
             }
             hits[k] = @([hits[k] integerValue] + 1);
         }
