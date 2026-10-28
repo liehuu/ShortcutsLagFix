@@ -193,59 +193,92 @@ def build_deb():
     return deb_path
 
 
+def parse_ar(path):
+    """统一的 ar 解析器，返回 [(name, data), ...]。
+
+    标准 System V ar 成员头固定 60 字节：
+        name[0:16] date[16:28] uid[28:34] gid[34:40]
+        mode[40:48] size[48:58] magic[58:60]
+    数据体后若长度为奇数，补 1 字节 '\\n'。
+
+    这里把解析集中到一处：此前 verify_deb 里写了两个几乎重复的遍历循环，
+    两处偏移处理稍有差异就会导致"第一遍成功、第二遍错位"，
+    而且报错信息只有一句 ValueError，根本无法定位。集中后只需维护一份。
+    """
+    members = []
+    with open(path, "rb") as f:
+        magic = f.read(8)
+        if magic != b"!<arch>\n":
+            die("不是合法 ar 归档（magic=%r）" % magic)
+
+        while True:
+            hdr = f.read(60)
+            if len(hdr) == 0:
+                break
+            if len(hdr) != 60:
+                die("ar 头部长度异常：期望 60，实际 %d（文件可能被截断）" % len(hdr))
+            if hdr[58:60] != b"`\n":
+                die("ar 头部 magic 异常：%r\n"
+                    "  完整头部 hex: %s\n"
+                    "  说明偏移与标准不符，不能再按固定位置截取字段。"
+                    % (hdr[58:60], hdr.hex()))
+
+            name = hdr[0:16].decode("ascii", "replace").rstrip()
+            # 去掉 GNU ar 的尾随 '/'（部分实现会加）
+            if name.endswith("/"):
+                name = name[:-1]
+
+            size_field = hdr[48:58].decode("ascii", "replace").strip()
+            try:
+                size = int(size_field)
+            except ValueError:
+                die("ar 头部 size 字段无法解析：%r\n"
+                    "  完整头部 hex: %s\n"
+                    "  size 字段原始 bytes: %r"
+                    % (size_field, hdr.hex(), hdr[48:58]))
+
+            data = f.read(size)
+            if len(data) != size:
+                die("成员 %s 数据被截断：期望 %d，实际 %d" %
+                    (name, size, len(data)))
+            if size % 2 == 1:
+                f.read(1)  # 奇数补齐
+            members.append((name, data))
+    return members
+
+
 def verify_deb(deb_path):
     """回读校验：ar 结构 + 必须存在的文件。"""
-    with open(deb_path, "rb") as f:
-        if f.read(8) != b"!<arch>\n":
-            die("deb 不是合法 ar 归档")
+    members = parse_ar(deb_path)
+    names = [n for n, _ in members]
+    print("[pack] ar 成员: " + ", ".join(names))
 
-        members = []
-        while True:
-            hdr = f.read(60)
-            if len(hdr) < 60:
-                break
-            name = hdr[0:16].decode("ascii").strip()
-            size = int(hdr[48:58].decode("ascii").strip())
-            members.append(name)
-            f.seek(size + (size % 2), os.SEEK_CUR)
-
-    print("[pack] ar 成员: " + ", ".join(members))
     for need in ("debian-binary", "control.tar.gz", "data.tar.gz"):
-        if need not in members:
+        if need not in names:
             die("deb 缺少成员: " + need)
 
-    # 重新遍历，解出 data.tar.gz 校验文件清单
-    with open(deb_path, "rb") as f:
-        f.read(8)
-        while True:
-            hdr = f.read(60)
-            if len(hdr) < 60:
-                break
-            name = hdr[0:16].decode("ascii").strip()
-            size = int(hdr[48:58].decode("ascii").strip())
-            data = f.read(size)
-            # 奇数长度后有 1 字节补齐，需跳过
-            if size % 2 == 1:
-                f.read(1)
-            if name == "data.tar.gz":
-                tmp = os.path.join(BUILD, "_verify_data.tar.gz")
-                with open(tmp, "wb") as g:
-                    g.write(data)
-                with tarfile.open(tmp, "r:gz") as tar:
-                    names = tar.getnames()
-                os.remove(tmp)
-                must = [
-                    "./Library/MobileSubstrate/DynamicLibraries/ShortcutsLagFix.dylib",
-                    "./Library/MobileSubstrate/DynamicLibraries/ShortcutsLagFix.plist",
-                    "./var/mobile/Library/Preferences/com.liehuu.shortcutslagfix.plist",
-                ]
-                for m in must:
-                    if m not in names:
-                        die("data 内缺少必需文件: " + m +
-                            "\n实际清单:\n  " + "\n  ".join(names))
-                print("[pack] data 清单校验 OK (%d 项)" % len(names))
-                break
-            f.seek(size % 2, os.SEEK_CUR)
+    # 校验 data.tar.gz 的文件清单
+    data_blob = dict(members)["data.tar.gz"]
+    tmp = os.path.join(BUILD, "_verify_data.tar.gz")
+    os.makedirs(BUILD, exist_ok=True)
+    with open(tmp, "wb") as g:
+        g.write(data_blob)
+    try:
+        with tarfile.open(tmp, "r:gz") as tar:
+            got = tar.getnames()
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+    must = [
+        "./Library/MobileSubstrate/DynamicLibraries/ShortcutsLagFix.dylib",
+        "./Library/MobileSubstrate/DynamicLibraries/ShortcutsLagFix.plist",
+        "./var/mobile/Library/Preferences/com.liehuu.shortcutslagfix.plist",
+    ]
+    for m in must:
+        if m not in got:
+            die("data 内缺少必需文件: " + m + "\n实际清单:\n  " + "\n  ".join(got))
+    print("[pack] data 清单校验 OK (%d 项)" % len(got))
 
     with open(deb_path, "rb") as f:
         sha = hashlib.sha256(f.read()).hexdigest()

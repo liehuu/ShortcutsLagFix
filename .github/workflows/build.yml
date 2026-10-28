@@ -46,6 +46,15 @@ jobs:
             exit 1
           }
 
+      - name: ar 解析边界测试
+        run: |
+          # 必须覆盖奇数长度成员。此前 verify_deb 在奇数长度下偏移多走 1 字节，
+          # 本地恰好全是偶数长度所以没暴露，CI 上直接崩。边界值要显式构造。
+          python3 test_ar.py || {
+            echo "::error::ar 解析边界测试失败"
+            exit 1
+          }
+
       - name: 打包逻辑离线测试
         run: |
           python3 test_pack.py || {
