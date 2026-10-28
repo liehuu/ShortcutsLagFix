@@ -162,6 +162,53 @@ def main():
     finally:
         pack.ROOT = _real_root
 
+    print("=== 5c. 回归：control 末尾缺换行时必须被拦截 ===")
+    # 复刻第二次真实事故（用户设备上的 dpkg 报错原文）：
+    #   parsing file '.../control' near line 8 package 'com.liehuu.shortcutslagfix':
+    #   end of file during value of field 'Depends' (missing final newline)
+    #
+    # 上一版之所以没被拦住，是因为所有检查都用 ctrl.strip() 后的文本，
+    # strip 恰好把"缺失的换行"这个事实抹掉了 —— 检查方式本身掩盖了缺陷。
+    # 因此这里直接对【原始字节】断言。
+    try:
+        with open(os.path.join(_real_root, "control"), "r", encoding="utf-8") as f:
+            no_eol = f.read().rstrip("\n")
+        no_eol_root = os.path.join(tmp, "noeol")
+        os.makedirs(no_eol_root, exist_ok=True)
+        with open(os.path.join(no_eol_root, "control"), "w", encoding="utf-8") as f:
+            f.write(no_eol)
+        pack.ROOT = no_eol_root
+        try:
+            pack.make_control()
+        except SystemExit:
+            print("    末尾缺换行 -> 已拦截 OK")
+        else:
+            raise AssertionError(
+                "control 末尾缺换行却未报错，闸门失效！dpkg 会拒绝安装："
+                "end of file during value of field 'Depends'")
+    finally:
+        pack.ROOT = _real_root
+
+    print("=== 5d. validate_control_text 双向验证 ===")
+    good = open(os.path.join(_real_root, "control"), "rb").read()
+    assert not pack.validate_control_text(good), \
+        "合法的 control 被判为不合格: %r" % pack.validate_control_text(good)
+    print("    合法 control -> 无告警 OK")
+
+    # 逐个注入缺陷，必须每个都被识别
+    cases = [
+        ("缺末尾换行", good.rstrip(b"\n"), "missing final newline"),
+        ("含 CR",      good.replace(b"\n", b"\r\n"), "CR"),
+        ("空行",       good.replace(b"\n", b"\n\n", 1), "空行"),
+        ("冒号后无空格", good.replace(b"Section: Tweaks", b"Section:Tweaks"), "缺空格"),
+    ]
+    for label, blob, expect_kw in cases:
+        probs = pack.validate_control_text(blob)
+        assert probs, "缺陷[%s]未被识别，校验失效" % label
+        assert any(expect_kw in p for p in probs), \
+            "缺陷[%s]报错信息未提及 %r，实际: %r" % (label, expect_kw, probs)
+        print("    %s -> 已识别 OK" % label)
+
     print("=== 6. 校验 data.tar.gz 清单与权限 ===")
     data_path = os.path.join(pack.BUILD, "_t_data.tar.gz")
     with open(data_path, "wb") as f:

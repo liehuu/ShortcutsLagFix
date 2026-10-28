@@ -29,7 +29,7 @@ OUTDEB = os.path.join(ROOT, "debs")
 
 NAME = "shortcutslagfix"
 PKG = "com.liehuu.shortcutslagfix"
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 
 # ---------------------------------------------------------------------------
 # Architecture 不是 CPU 架构，而是【包布局标志】。这是 RootHide 踩过的最大的坑：
@@ -162,7 +162,73 @@ def make_control():
                 "两处必须同步，否则会产出错误的包。" % (key, got, want))
 
     print("[pack] control 校验 OK (Architecture=%s, Version=%s)" % (ARCH, VERSION))
-    return control.encode("utf-8")
+
+    # ★ 语法校验：dpkg 解析 control 时按「字段行」逐行读，
+    # 最后一个字段的值必须由换行符终结。缺了这个换行，dpkg 报：
+    #   parsing file '/Library/dpkg/tmp.ci/control' near line N
+    #   package 'xxx': end of file during value of field 'Depends'
+    #   (missing final newline)
+    # 这是真实事故：control 最后一行没有 '\n'，包打得出来、
+    # 所有自研检查全绿（因为读的时候 .strip() 把尾巴吃掉了），
+    # 装到设备上才被 dpkg 拒绝。
+    control_bytes = control.encode("utf-8")
+    if not control_bytes.endswith(b"\n"):
+        die("control 文件末尾缺少换行符。dpkg 会报 "
+            "'end of file during value of field ... (missing final newline)' "
+            "并拒绝安装。请在 control 最后一行末尾补一个 '\\n'。")
+
+    # 成对换行（末尾空行）本身不致命，但部分 dpkg 版本对空字段段敏感，
+    # 统一收敛成一个换行，保证产物稳定可复现。
+    control_bytes = control_bytes.rstrip(b"\n") + b"\n"
+
+    return control_bytes
+
+
+def validate_control_text(raw):
+    """对【已经打进包里的】control 字节做 dpkg 兼容性校验。
+
+    与 make_control 分开的原因：make_control 校验的是源文件，
+    这里校验的是产物里的实际字节 —— 两者可能因为打包逻辑的 bug 而不一致。
+    验尸必须直接看产物，不能只看源。
+    """
+    problems = []
+    if not raw:
+        return ["control 为空"]
+    if not raw.endswith(b"\n"):
+        problems.append(
+            "control 末尾缺少换行 -> dpkg 报 'missing final newline'，装不上")
+    if b"\r" in raw:
+        problems.append("control 含 CR(\\r)，dpkg 字段解析会错乱")
+
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as e:
+        return problems + ["control 不是合法 UTF-8: %s" % e]
+
+    lines = text.splitlines()
+    if not lines or not lines[0].strip():
+        problems.append("control 首行不能为空（应为 Package: 开头）")
+
+    # 逐行检查字段语法：每行要么是 "Key: value"，要么是续行（以空格/Tab 开头）
+    for i, ln in enumerate(lines, 1):
+        if not ln.strip():
+            problems.append("第 %d 行为空行，字段段中不允许出现空行" % i)
+            continue
+        if ln[0] in (" ", "\t"):
+            continue  # 合法的续行
+        if ":" not in ln:
+            problems.append("第 %d 行不是 'Key: value' 格式: %r" % (i, ln))
+            continue
+        key, val = ln.split(":", 1)
+        if not key.strip():
+            problems.append("第 %d 行字段名为空" % i)
+        # dpkg 要求字段名不含空格
+        if " " in key.strip():
+            problems.append("第 %d 行字段名含空格: %r" % (i, key))
+        if not val.startswith(" ") and val.strip():
+            problems.append("第 %d 行 %r 冒号后缺空格" % (i, key.strip()))
+
+    return problems
 
 
 def tar_dir(src_dir, out_path, arc_root="."):
@@ -313,6 +379,30 @@ def verify_deb(deb_path):
     for need in ("debian-binary", "control.tar.gz", "data.tar.gz"):
         if need not in names:
             die("deb 缺少成员: " + need)
+
+    # ---- control 语法校验（对产物里的真实字节）----
+    # 这一项曾完全缺失：所有检查都是"内容包含"式，
+    # 没有一个在检查 control 是否符合 dpkg 的解析要求。
+    # 结果末尾缺换行的包一路通过所有检查，装到设备才被 dpkg 拒绝。
+    ctrl_blob = dict(members)["control.tar.gz"]
+    tmpc = os.path.join(BUILD, "_verify_control.tar.gz")
+    os.makedirs(BUILD, exist_ok=True)
+    with open(tmpc, "wb") as g:
+        g.write(ctrl_blob)
+    try:
+        with tarfile.open(tmpc, "r:gz") as tar:
+            cnames = [n for n in tar.getnames() if n.rstrip("/").endswith("control")]
+            if not cnames:
+                die("control.tar.gz 里找不到 control 文件")
+            raw_ctrl = tar.extractfile(cnames[0]).read()
+    finally:
+        if os.path.exists(tmpc):
+            os.remove(tmpc)
+
+    problems = validate_control_text(raw_ctrl)
+    if problems:
+        die("control 语法不合格，dpkg 会拒绝安装：\n  - " + "\n  - ".join(problems))
+    print("[pack] control 语法校验 OK（%d 字节，末尾换行正确）" % len(raw_ctrl))
 
     # 校验 data.tar.gz 的文件清单
     data_blob = dict(members)["data.tar.gz"]

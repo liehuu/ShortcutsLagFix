@@ -129,10 +129,26 @@ def main(deb_path):
         f.write(d["control.tar.gz"])
     with tarfile.open(tmpc, "r:gz") as t:
         cn = [n for n in t.getnames() if n.endswith("control")]
-        ctrl = t.extractfile(cn[0]).read().decode("utf-8")
+        raw_ctrl = t.extractfile(cn[0]).read()
+        ctrl = raw_ctrl.decode("utf-8")
     os.remove(tmpc)
     for line in ctrl.strip().split("\n"):
         print("      " + line)
+
+    # ★ 先做语法校验（dpkg 是否愿意解析），再做字段内容校验。
+    # 历史漏洞：此前所有检查都是「内容包含」式，没有任何一项检查
+    # control 的语法合规性。于是末尾缺换行的包全部检查通过，
+    # 装到设备被 dpkg 拒绝：
+    #   end of file during value of field 'Depends' (missing final newline)
+    # 注意：不能用 ctrl.strip() 后的文本判断 —— strip 会把缺失的换行吃掉，
+    # 必须看原始字节。
+    syntax_problems = pack.validate_control_text(raw_ctrl)
+    if syntax_problems:
+        for p in syntax_problems:
+            bad("control 语法: " + p)
+    else:
+        ok("control 语法合规（%d 字节，末尾换行正确，无 CR）" % len(raw_ctrl))
+
     for key in ("Package:", "Name:", "Version:", "Architecture:", "Maintainer:", "Depends:"):
         if key in ctrl:
             ok("含 %s" % key)
