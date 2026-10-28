@@ -44,23 +44,38 @@ def check_dylib():
     if not os.path.exists(DYLIB):
         die("dylib 不存在，先跑 build.sh: %s" % DYLIB)
 
-    # macOS 上用 lipo 验证；本地 Windows 无 lipo 时退化为解析 Mach-O 头
-    try:
-        info = subprocess.run(["lipo", "-info", DYLIB],
-                              capture_output=True, text=True)
-        if info.returncode == 0:
-            print("[pack] lipo -info: " + info.stdout.strip())
-            if "arm64" not in info.stdout or "arm64e" not in info.stdout:
-                die("dylib 不是 arm64+arm64e 双切片，在 arm64e 设备上会静默失效")
-    except FileNotFoundError:
-        print("[pack] 无 lipo，改用 Mach-O 头解析")
-        with open(DYLIB, "rb") as f:
-            magic = f.read(4)
-        if magic != b"\xca\xfe\xba\xbe":
-            die("dylib 不是 FAT 二进制（magic=%r）" % magic)
-        print("[pack] FAT magic OK")
+    # 直接解析 FAT 头判定双切片。
+    # 不用 lipo 的原因：CI 上有 lipo，但本地 Windows 没有；
+    # 而 `lipo -info | grep arm64e` 这种文本匹配无法区分
+    # "arm64e 切片存在" 与 "只输出里恰好出现 arm64e 字样"。
+    # 字节级判定更可靠，且两边行为一致。
+    with open(DYLIB, "rb") as f:
+        head = f.read(8)
+    if head[0:4] != b"\xca\xfe\xba\xbe":
+        die("dylib 不是 FAT 二进制（magic=%r）。"
+            "单切片产物在 arm64e 设备上会被加载器跳过" % head[0:4])
 
-    # adhoc 签名检查（arm64e 上 RootHide 加载器会跳过无签名 dylib）
+    nfat = struct.unpack(">I", head[4:8])[0]
+    archs = []
+    with open(DYLIB, "rb") as f:
+        for i in range(nfat):
+            f.seek(8 + i * 20)
+            cputype, cpusub = struct.unpack(">II", f.read(8))
+            # arm64e 的 subtype 实测为 0x80000002（含 PTRAUTH_ABI 标志位），
+            # 必须掩掉高位再比对，否则会把正确的 arm64e 判成未知（已踩）。
+            base = cpusub & 0x00FFFFFF
+            if cputype == 0x0100000C:
+                archs.append({0: "arm64", 2: "arm64e"}.get(base, "arm64(0x%x)" % cpusub))
+            else:
+                archs.append("cputype0x%x" % cputype)
+
+    print("[pack] 架构: %s" % archs)
+    if "arm64" not in archs:
+        die("产物不含 arm64")
+    if "arm64e" not in archs:
+        die("产物不含 arm64e —— 在用户 arm64e 设备上会静默失效，拒绝交付")
+
+    # adhoc 签名检查（RootHide 加载器会跳过无签名 dylib）
     try:
         dv = subprocess.run(["codesign", "-dv", DYLIB],
                             capture_output=True, text=True)
@@ -70,7 +85,7 @@ def check_dylib():
         else:
             die("dylib 未 adhoc 签名，RootHide 加载器会跳过它")
     except FileNotFoundError:
-        print("[pack] 无 codesign，跳过签名校验（由 CI 保证）")
+        print("[pack] 无 codesign（非 macOS），跳过签名校验 —— 由 CI 保证")
 
 
 def check_layout():

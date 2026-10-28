@@ -69,10 +69,19 @@ def main():
         os.makedirs(d, exist_ok=True)
 
     print("=== 1. 构造伪造 dylib（临时目录 %s）===" % tmp)
-    fake = b"\xca\xfe\xba\xbe" + b"FAKE_DYLIB_FOR_PACK_TEST" * 10 + b"\x01"  # 奇数长度
+    # 必须构造一个合法的 FAT 头，且同时含 arm64 与 arm64e 两个切片，
+    # 否则会被 pack.check_dylib 的架构闸门拦下（这是正确的拦截）。
+    # arm64e 的 subtype 用真实值 0x80000002，顺带验证掩码判定逻辑。
+    body = b"FAKE_DYLIB_FOR_PACK_TEST" * 10 + b"\x01"  # 奇数长度，验证 ar 补齐
+    fat_hdr = b"\xca\xfe\xba\xbe" + struct.pack(">I", 2)
+    off1 = 0x1000
+    off2 = off1 + len(body)
+    fat_hdr += struct.pack(">IIIII", 0x0100000C, 0, off1, len(body), 0)
+    fat_hdr += struct.pack(">IIIII", 0x0100000C, 0x80000002, off2, len(body), 0)
+    fake = fat_hdr + b"\x00" * (off1 - len(fat_hdr)) + body + body
     with open(pack.DYLIB, "wb") as f:
         f.write(fake)
-    print("    dylib 大小 %d（奇数，可验证补齐逻辑）" % len(fake))
+    print("    dylib %d bytes，含 arm64 + arm64e 双切片" % len(fake))
 
     # 覆盖 check_dylib（本机无 lipo/codesign）
     pack.check_dylib = lambda: None

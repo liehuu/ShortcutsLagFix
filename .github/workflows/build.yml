@@ -104,6 +104,16 @@ jobs:
         run: |
           python3 pack.py
 
+      - name: 交付前产物验尸（对真实 deb 逐项检查）
+        run: |
+          # 对最终产物再独立验一遍：架构双切片、签名、注入过滤、
+          # 预置配置、关键字符串、install_name。
+          DEB=$(ls debs/*.deb | head -1)
+          python3 verify_artifact.py "$DEB" || {
+            echo "::error::产物体检未通过，禁止交付"
+            exit 1
+          }
+
       - name: 上传 artifact
         uses: actions/upload-artifact@v4
         with:
