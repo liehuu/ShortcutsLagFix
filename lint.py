@@ -132,23 +132,65 @@ def check_format(f, lines):
 
 
 # ---------- [3] 隐式声明 ----------
-def check_implicit(f, lines):
+_DECL_PAT = re.compile(
+    r'\b(?:void|BOOL|int|NSInteger|uint64_t|const\s+char|NSString)\s*\*?\s*(SLF\w+)\s*\(')
+
+
+def _collect_decls(lines):
     declared = set()
     for ln in lines:
-        for m in re.finditer(r'\b(?:void|BOOL|int|NSInteger|NSString\s*\*|uint64_t)\s+'
-                             r'(SLF\w+)\s*\(', ln):
+        for m in _DECL_PAT.finditer(ln):
             declared.add(m.group(1))
-        for m in re.finditer(r'\bextern\s+.*?\b(SLF\w+)\s*\(', ln):
-            declared.add(m.group(1))
+    return declared
+
+
+_header_cache = None
+
+
+def _header_decls():
+    """SLFCommon.h 里的声明对所有 .m 文件都有效。"""
+    global _header_cache
+    if _header_cache is not None:
+        return _header_cache
+    s = set()
+    p = os.path.join(SRC, "SLFCommon.h")
+    if os.path.exists(p):
+        with open(p, "r", encoding="utf-8", errors="replace") as fh:
+            s = _collect_decls(fh.read().split("\n"))
+    _header_cache = s
+    return s
+
+
+def check_implicit(f, lines):
+    """[3] 检查是否调用了未声明的函数。
+
+    ★ 原实现有两个缺陷，一起导致了 134 条纯噪音（0 真实问题）：
+      1. 声明正则要求「类型 + 至少一个空格 + 函数名」，而
+         `NSString *SLFLogPath(void);` 里 '*' 与函数名之间**没有空格**，
+         于是连头文件里的声明自己都没被认出来；
+      2. declared 集合只收集**当前文件**内的声明，导致所有在
+         SLFCommon.h 里声明、在 .m 里使用的跨文件函数全被判为未声明。
+      噪音的代价是真实的：134 条假告警会把真问题彻底淹没，
+      和之前 lint [14] 误报是同一类事故。
+    """
+    declared = _collect_decls(lines) | _header_decls()
+
+    # 宏不是函数：`#define SLFGetPC(st) __darwin_..._get_pc(*(st))`
+    # 展开后长得像调用，但永远不需要"声明"。
+    macros = set()
+    for ln in lines:
+        for m in re.finditer(r"#\s*define\s+(SLF\w+)\s*\(", ln):
+            macros.add(m.group(1))
 
     for i, ln in enumerate(lines, 1):
         for m in re.finditer(r'\b(SLF[A-Z]\w+)\s*\(', ln):
             name = m.group(1)
-            if name in declared:
+            if name in declared or name in macros:
                 continue
-            # 允许：定义行自身、函数指针类型名、宏
-            if re.search(r'^\s*(?:static\s+)?(?:void|BOOL|int|NSInteger|NSString\s*\*|uint64_t)\s+'
-                         r'%s\s*\(' % re.escape(name), ln):
+            # 定义行自身：类型 + 可选空格 + 函数名
+            if re.search(r'^\s*(?:static\s+)?(?:__attribute__\S+\s+)?'
+                         r'(?:void|BOOL|int|NSInteger|uint64_t|const\s+char|NSString)'
+                         r'\s*\*?\s*%s\s*\(' % re.escape(name), ln):
                 continue
             warn(f, i, "[3] %s 可能未声明（确认是否需前置声明）" % name)
 
@@ -201,18 +243,50 @@ def check_hook_io(f, lines):
 
 # ---------- [7] orig 空判 ----------
 def check_orig_null(f, lines):
+    """[7] hook 转发前是否判过 orig 非空。
+
+    ★ 判据必须是「同一函数内、调用之前」，不能只看同一行。
+      原实现只看当前行是否含判空语句，于是下面这种完全正确的写法被误报：
+          static void SLFTVReload(...) {
+              if (gOrigTVReload == NULL) return;   // 第 99 行已判
+              ...
+              gOrigTVReload(self, _cmd);           // 第 105 行被误报
+          }
+      真实的崩溃风险是「进了函数一路到调用都没判过空」，这才是要抓的。
+    """
+    # 先定位每个函数的起始行
+    func_starts = []
+    for i, ln in enumerate(lines, 1):
+        code = re.sub(r"//.*$", "", ln)
+        if re.search(r'^\s*(?:__attribute__[^\s]*\s+)?static\s+[^;]*\bSLF\w+\s*\([^;]*\)\s*\{', code):
+            func_starts.append(i)
+
+    def guard_in(c2, name):
+        return bool(re.search(r'%s\s*==\s*NULL' % re.escape(name), c2) or
+                    re.search(r'%s\s*==\s*Nil' % re.escape(name), c2) or
+                    re.search(r'!\s*%s\b' % re.escape(name), c2) or
+                    re.search(r'if\s*\(\s*%s\b' % re.escape(name), c2))
+
     for i, ln in enumerate(lines, 1):
         code = re.sub(r"//.*$", "", ln)
         for m in re.finditer(r'\b(gOrig\w+)\s*\(', code):
             name = m.group(1)
-            if "if" in code and name in code:
+            if guard_in(code, name):
                 continue
-            # 同一行内含 "if (name)" 视为已判
-            if re.search(r'if\s*\(\s*%s\b' % re.escape(name), code) or \
-               re.search(r'%s\s*==\s*NULL' % re.escape(name), code) or \
-               re.search(r'!\s*%s\b' % re.escape(name), code):
-                continue
-            warn(f, i, "[7] %s 调用前请确认已判非空" % name)
+            # 所属函数起点
+            start = 1
+            for s in func_starts:
+                if s <= i:
+                    start = s
+                else:
+                    break
+            guarded = False
+            for k in range(start, i):
+                if guard_in(re.sub(r"//.*$", "", lines[k - 1]), name):
+                    guarded = True
+                    break
+            if not guarded:
+                warn(f, i, "[7] %s 调用前未见判空（同一函数内也没找到）" % name)
 
 
 # ---------- [8] block IMP / dlopen substrate ----------
@@ -427,6 +501,46 @@ def check_test_isolation():
             "[18] 测试脚本改写了生产 layout/ 却未重定向到临时目录（会删真实文件）")
 
 
+# ---------- [19] 文档/脚本里的包版本号必须等于 control ----------
+def check_version_refs():
+    """README 等文档里出现的包文件名版本，必须与 control 的 Version 一致。
+
+    真实事故（连续两次）：README 的安装命令先写 1.0.1、后来写 1.0.2，
+    而 control 已经升到 1.0.3 —— 升版本时只改了 control 和 pack.py，
+    忘了改文档。用户照着文档抄命令，就会去下载那个已经证明装不上的旧包。
+
+    版本号是全项目最容易被漏掉的引用点，必须机器检查，不能靠记性。
+    """
+    cpath = os.path.join(ROOT, "control")
+    try:
+        with open(cpath, "rb") as f:
+            raw = f.read().decode("utf-8")
+    except OSError:
+        return
+    ver = ""
+    for line in raw.split("\n"):
+        if line.startswith("Version:"):
+            ver = line.split(":", 1)[1].strip()
+            break
+    if not ver:
+        err("control", 0, "[19] control 里没有 Version 字段")
+        return
+
+    # 只匹配包文件名形式，避免把 "iOS 17.0.3" 之类的版本误当包版本
+    pat = re.compile(r"shortcutslagfix_(\d+\.\d+\.\d+)_")
+    for fn in ("README.md", "build.sh", ".github/workflows/build.yml"):
+        p = os.path.join(ROOT, fn)
+        if not os.path.exists(p):
+            continue
+        with open(p, encoding="utf-8", errors="replace") as f:
+            for i, ln in enumerate(f, 1):
+                for m in pat.finditer(ln):
+                    if m.group(1) != ver:
+                        err(fn, i,
+                            "[19] 这里写的是 %s，而 control 是 %s —— 照抄会下错包"
+                            % (m.group(1), ver))
+
+
 def main():
     files = sources()
     if not files:
@@ -454,6 +568,7 @@ def main():
         check_set_but_unused(f, lines)
 
     check_test_isolation()
+    check_version_refs()
 
     for w in warnings:
         print("[WARN] " + w)

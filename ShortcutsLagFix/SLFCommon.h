@@ -14,7 +14,17 @@
 #import <stdatomic.h>
 #import <mach/mach_time.h>
 
-#define SLF_VERSION "1.0.0"
+// ★ 版本号由构建时从 control 注入（build.sh 传 -DSLF_VERSION=\"x.y.z\"）。
+//
+// 绝不再在此写死字面量。实测教训：这里曾固定为 "1.0.0"，之后 control 依次
+// 升到 1.0.1 / 1.0.2 / 1.0.3，而**三次交付的日志全都自报 v1.0.0**。
+// 拿到用户日志时我第一反应是"你装的是旧包吧"，等于让工具自己制造假线索。
+//
+// 兜底值故意写得刺眼：一旦构建脚本漏了注入，日志会直接印出
+// 0.0.0-unknown，而不是谎报一个看起来正常的版本号。
+#ifndef SLF_VERSION
+#define SLF_VERSION "0.0.0-unknown"
+#endif
 
 #pragma mark - 日志
 
@@ -60,6 +70,14 @@ NSString *SLFStatDescribe(SLFStat *s);
 
 void SLFStartWatchdog(void);
 void SLFInstallHooks(void);
+
+/// 后台预热一次性系统初始化（字体 / 词典 / 语言分析 / ImageIO）。
+/// 必须在主线程之外调用；内部自行排队到后台并从文件作用域持有队列。
+void SLFWarmupStart(void);
+
+/// 主线程当前是否仍在正常响应（最近 200ms 内刷新过心跳）。
+/// 预热的礼貌退让判据：主线程正卡着的时候不要再叠加负载。
+BOOL SLFMainThreadResponsive(void);
 
 /// 输出各 hook 的耗时统计（由看门狗定时调用）。
 void SLFDumpStats(void);

@@ -34,6 +34,7 @@ SOURCES=(
     "${SRC}/SLFCore.m"
     "${SRC}/SLFWatchdog.m"
     "${SRC}/SLFHooks.m"
+    "${SRC}/SLFWarmup.m"
 )
 
 for f in "${SOURCES[@]}"; do
@@ -43,6 +44,19 @@ for f in "${SOURCES[@]}"; do
     fi
 done
 
+# ---- 版本号：唯一真源是 control ----
+#
+# ★ 必须从 control 读，不能在源码里写死。
+#   实测事故：SLFCommon.h 里曾固定 SLF_VERSION "1.0.0"，之后 control 依次
+#   升到 1.0.1 / 1.0.2 / 1.0.3，而三次交付的 dylib 全都自报 v1.0.0。
+#   拿到用户日志时我第一反应是"你是不是装了旧包"，等于工具自己在制造假线索。
+PKG_VERSION="$(sed -n 's/^Version:[[:space:]]*//p' "${ROOT}/control" | tr -d '\r\n')"
+if [ -z "${PKG_VERSION}" ]; then
+    echo "[build][FATAL] 无法从 control 读取 Version" >&2
+    exit 1
+fi
+echo "[build] 版本号（来自 control） = ${PKG_VERSION}"
+
 COMMON_FLAGS=(
     -fobjc-arc
     -fmodules
@@ -51,11 +65,15 @@ COMMON_FLAGS=(
     -Wno-unused-function
     -Wno-deprecated-declarations
     -Wno-nullability-completeness
+    "-DSLF_VERSION=\"${PKG_VERSION}\""
     -isysroot "${SDK}"
     -framework Foundation
     -framework UIKit
     -framework QuartzCore
     -framework CoreFoundation
+    -framework CoreText
+    -framework ImageIO
+    -framework NaturalLanguage
     -dynamiclib
 )
 
@@ -98,6 +116,25 @@ if ! echo "${ARCH_INFO}" | grep -q "arm64e"; then
     echo "[build][FATAL] 产物不含 arm64e —— 在用户 arm64e 设备上会静默失效，拒绝交付" >&2
     exit 1
 fi
+
+# ---- 硬闸门：产物内的版本字符串必须与 control 一致 ----
+#
+# 这条闸门专门防"改了 control 忘了版本同步"这类事故。
+# 用 python 做精确匹配而不是 grep：grep 会把 "1.0.4" 命中 "1.0.40"，
+# 而这里要的是"这个字符串确实作为独立版本号存在"。
+echo "[build] 校验产物内版本号 ..."
+"${PYTHON:-python3}" - "${OUT}/${DYLIB_NAME}.dylib" "${PKG_VERSION}" <<'PYEOF'
+import sys
+path, ver = sys.argv[1], sys.argv[2]
+raw = open(path, "rb").read()
+# C 字符串字面量在 Mach-O 里以 NUL 结尾；UTF-8 与 UTF-16LE 两种都认。
+needles = [ver.encode("utf-8") + b"\x00", ver.encode("utf-16-le")]
+if not any(n in raw for n in needles):
+    sys.stderr.write("[build][FATAL] 产物里找不到版本号 %r。\n"
+                     "  -DSLF_VERSION 可能未生效，日志会自报 0.0.0-unknown。\n" % ver)
+    sys.exit(1)
+print("[build] 版本号校验 OK: %s" % ver)
+PYEOF
 
 # ---- adhoc 签名 ----
 echo "[build] adhoc 签名 ..."

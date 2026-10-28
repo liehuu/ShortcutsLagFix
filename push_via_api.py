@@ -76,6 +76,19 @@ def sh(args):
     return r.stdout
 
 
+def sh_bytes(args):
+    """同 sh()，但返回原始字节。
+
+    读 blob 内容时必须用字节模式：text=True 会做换行符转换，
+    把 LF 变成平台默认的 CRLF，正好毁掉我们要的那个字节序列。
+    """
+    r = subprocess.run(args, cwd=ROOT, capture_output=True)
+    if r.returncode != 0:
+        raise RuntimeError("git %s 失败: %s" % (" ".join(args),
+                                                r.stderr[:300].decode("utf-8", "replace")))
+    return r.stdout
+
+
 def remote_tree(gh, tree_sha):
     """递归展开远端 tree -> {path: blob_sha}（只收 blob）。"""
     st, d = gh.req("GET", "/repos/%s/git/trees/%s?recursive=1" % (REPO, tree_sha))
@@ -127,11 +140,17 @@ def main():
             print("  %s  %s" % (tag, p))
 
     # 2. 逐文件建 blob（删除的文件用 sha=null）
+    #
+    # ★ 必须用 `git cat-file blob <sha>` 从对象库取内容，不能读工作区文件。
+    #   本机工作区是 CRLF（Windows 编辑器写出来的），而 .gitattributes 规定
+    #   eol=lf，git 在 add 时已把内容规范化成 LF 存进对象库。
+    #   读工作区文件上传 CRLF 版，算出的 blob sha 与 git 的 LF 版对不上，
+    #   脚本会以 "blob sha 不一致" 报错退出 —— 我第一次推送 v1.0.4 就卡在这。
+    #   cat-file 输出的正是仓库里的原始字节，天然与 ltree 里的 sha 一致，
+    #   也顺带保证远端拿到的换行符与 CI checkout 的完全一致。
     entries = []
     for rel in added + changed:
-        path = os.path.join(ROOT, rel)
-        with open(path, "rb") as fh:
-            raw = fh.read()
+        raw = sh_bytes(["git", "cat-file", "blob", ltree[rel]])
         st, blob = gh.req("POST", "/repos/%s/git/blobs" % REPO, {
             "content": base64.b64encode(raw).decode("ascii"),
             "encoding": "base64",

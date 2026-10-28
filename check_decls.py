@@ -45,7 +45,13 @@ def main():
 
     # static 定义
     defined = {}
-    ret_types = r"void|BOOL|NSInteger|uint64_t|NSString|IMP|dispatch_source_t"
+    #
+    # ret_types 必须覆盖项目里实际用到的所有返回类型。
+    # 漏一个的后果不是"漏报"，而是**误报**：定义没被收录 → 调用点被判成
+    # "未声明的函数"，于是一堆假错误把所有真问题淹没。
+    # 实测：这里原先没有 "const char"，SLFImageNameAndOffset 因此被误报 3 次。
+    ret_types = (r"void|BOOL|NSInteger|uint64_t|NSString|IMP|dispatch_source_t"
+                 r"|const\s+char")
     for f in sorted(glob.glob(os.path.join(SRC, "*.m"))):
         body = strip_comments(open(f, encoding="utf-8").read())
         for m in re.finditer(
@@ -122,12 +128,20 @@ def main():
 
 
 def split_args(s):
-    """按顶层逗号切分参数列表。"""
+    """按顶层逗号切分参数列表。
+
+    ★ 只把 ()[]{} 当作成对括号，**不要**把 <> 也算进去。
+      实测教训：原实现把 '<' '>' 当括号，而 C/ObjC 的箭头操作符 -> 里的 '>'
+      会让深度变成负数，此后所有逗号都被判为"在括号内"而不切分 ——
+      SLFImageNameAndOffset(st->addrs[i], &off, &sym) 于是被数成 1 个实参，
+      和原型 3 个不符，报出一条假错误。
+      ObjC 里尖括号只用于泛型/协议限定，成对出现，不影响顶层逗号的切分。
+    """
     out, depth, cur = [], 0, ""
     for ch in s:
-        if ch in "([{<":
+        if ch in "([{":
             depth += 1
-        elif ch in ")]}>":
+        elif ch in ")]}":
             depth -= 1
         if ch == "," and depth == 0:
             out.append(cur)

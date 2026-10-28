@@ -29,7 +29,32 @@ OUTDEB = os.path.join(ROOT, "debs")
 
 NAME = "shortcutslagfix"
 PKG = "com.liehuu.shortcutslagfix"
-VERSION = "1.0.3"
+
+
+def _read_control_field(field):
+    """从根目录 control 读取字段值。
+
+    ★ 版本号必须只有这一个真源。
+      此前 pack.py 里还有一个独立的 VERSION 常量，与 control 各写一份，
+      改了一处忘了另一处就会产出"包名版本 A、control 版本 B"的包 ——
+      Sileo 按版本号判重，版本没 bump 就会当成同一个包不更新。
+      现在这里改成直接读 control，并用断言保证二者不可能再漂移。
+    """
+    path = os.path.join(ROOT, "control")
+    try:
+        with open(path, "rb") as f:
+            raw = f.read().decode("utf-8")
+    except OSError as e:
+        raise SystemExit("[pack][FATAL] 读不到 control: %s" % e)
+    for line in raw.split("\n"):
+        if line.startswith(field + ":"):
+            return line.split(":", 1)[1].strip()
+    return ""
+
+
+VERSION = _read_control_field("Version")
+if not VERSION:
+    raise SystemExit("[pack][FATAL] control 里没有 Version 字段")
 
 # ---------------------------------------------------------------------------
 # Architecture 不是 CPU 架构，而是【包布局标志】。这是 RootHide 踩过的最大的坑：

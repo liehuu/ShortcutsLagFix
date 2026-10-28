@@ -22,6 +22,7 @@
 #import <QuartzCore/QuartzCore.h>
 #import <pthread.h>
 #import <os/lock.h>
+#import <unistd.h>
 
 #pragma mark - 统计量（全部锁自由，可并发累加）
 
@@ -236,6 +237,78 @@ static BOOL SLFReplaceOwnMethod(Class cls, SEL sel, IMP newImp, IMP *outOrig) {
     return YES;
 }
 
+// 子类扫描：只在后台执行，且分片让出 runtime 锁。
+//
+// ★ 为什么必须搬离主线程（实测证据，来自用户 v1.0.0 日志）：
+//   第 1 次 stall 313ms 的栈是
+//     #0 DriverManagement
+//     #3 libobjc.A.dylib  objc_getClassList
+//     #4 ShortcutsLagFix.dylib  SLFInstallOnce
+//     #8 ShortcutsLagFix.dylib  __SLFScheduleSetup_block_invoke
+//   即：本插件自己在主线程上遍历全部已注册类，被自己的看门狗抓了个正着。
+//   时间戳也印证：初始化开始 11.350 → hook 装完 11.353（仅 3ms）→
+//   打印"哪些子类覆写了 reloadData" 11.984（多出 631ms）。
+//   这段 631ms 纯粹是本插件自己制造的卡顿，与要诊断的问题无关。
+//
+//   它很贵的真正原因：objc_getClassList 填充三万个类指针本身不慢，
+//   但随后对每个类调 class_getSuperclass / class_copyMethodList 会触发
+//   realizeClass（实例化类、挂方法列表、跑 +load），而 3 万个类里绝大多数
+//   与本次诊断毫无关系。
+//
+// 分片让出：每 1000 个类 usleep 一次。目的是避免后台长时间持有 runtime 的
+// 全局锁 —— 主线程走 msgSend 慢路径时也要拿这把锁，被我们长时间占住的话，
+// 等于把主线程的卡顿从"自有开销"换成了"等锁"，等于没修。
+#define SLF_SCAN_YIELD_EVERY 1000
+
+static void SLFScanSubclasses(void) {
+    @autoreleasepool {
+        int total = objc_getClassList(NULL, 0);
+        if (total <= 0) return;
+
+        Class *all = (Class *)calloc((size_t)total, sizeof(Class));
+        if (all == NULL) return;
+        unsigned int n = (unsigned int)objc_getClassList(all, total);
+
+        NSMutableArray *overrides = [NSMutableArray array];
+        Class tvCls = [UITableView class];
+        Class cvCls = [UICollectionView class];
+
+        for (unsigned int i = 0; i < n; i++) {
+            if ((i % SLF_SCAN_YIELD_EVERY) == 0 && i > 0) {
+                usleep(1000);   // 1ms，明确让出 runtime 锁
+            }
+            @autoreleasepool {
+                Class c = all[i];
+                Class sup = class_getSuperclass(c);
+                if (sup == Nil) continue;
+                if (sup != tvCls && sup != cvCls) continue;
+
+                unsigned int mc = 0;
+                Method *ml = class_copyMethodList(c, &mc);
+                BOOL has = NO;
+                if (ml != NULL) {
+                    for (unsigned int k = 0; k < mc; k++) {
+                        if (method_getName(ml[k]) == @selector(reloadData)) { has = YES; break; }
+                    }
+                    free(ml);
+                }
+                // 上限 20：只为提示，无需穷举；也避免日志行过长。
+                if (has && overrides.count < 20) {
+                    [overrides addObject:NSStringFromClass(c)];
+                }
+            }
+        }
+        free(all);
+
+        if (overrides.count > 0) {
+            SLFLog(@"[hook] 注意：以下子类覆写了 reloadData，其调用不经过本插件: %@",
+                   [overrides componentsJoinedByString:@", "]);
+        } else {
+            SLFLog(@"[hook] 子类扫描完成，未发现覆写 reloadData 的子类");
+        }
+    }
+}
+
 static void SLFInstallAll(void) {
     BOOL ok = NO;
 
@@ -269,44 +342,15 @@ static void SLFInstallAll(void) {
         SLFLogAlways(@"[hook] NSFetchedResultsController 不存在，跳过");
     }
 
-    // 子类覆写了这些方法的情况：子类实现会绕过我们的 hook。
-    // 记录实际有哪些子类覆写了 reloadData，便于判断 hook 是否覆盖到目标界面。
-    @try {
-        unsigned int n = 0;
-        int total = objc_getClassList(NULL, 0);
-        if (total > 0) {
-            Class *all = (Class *)calloc((size_t)total, sizeof(Class));
-            if (all != NULL) {
-                n = (unsigned int)objc_getClassList(all, total);
-                NSMutableArray *overrides = [NSMutableArray array];
-                for (unsigned int i = 0; i < n; i++) {
-                    Class c = all[i];
-                    Class sup = class_getSuperclass(c);
-                    if (sup == Nil) continue;
-                    // 只看直接继承 UITableView / UICollectionView 的子类
-                    if ((sup == [UITableView class] || sup == [UICollectionView class])) {
-                        unsigned int mc = 0;
-                        Method *ml = class_copyMethodList(c, &mc);
-                        BOOL has = NO;
-                        if (ml) {
-                            for (unsigned int k = 0; k < mc; k++) {
-                                if (method_getName(ml[k]) == @selector(reloadData)) { has = YES; break; }
-                            }
-                            free(ml);
-                        }
-                        if (has && overrides.count < 20) {
-                            [overrides addObject:NSStringFromClass(c)];
-                        }
-                    }
-                }
-                free(all);
-                if (overrides.count > 0) {
-                    SLFLogAlways(@"[hook] 注意：以下子类覆写了 reloadData，其调用不经过本插件: %@",
-                                 [overrides componentsJoinedByString:@", "]);
-                }
-            }
-        }
-    } @catch (__unused NSException *e) {}
+    // 子类扫描放到后台，且在 hook 全部装好之后再排队。
+    // 这里用 BACKGROUND 优先级：它只是诊断信息，任何时候都不该和主线程抢 CPU。
+    if (SLFBool(@"ScanSubclasses", YES)) {
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{
+            @try {
+                SLFScanSubclasses();
+            } @catch (__unused NSException *e) {}
+        });
+    }
 }
 
 // pthread_once 只接受 C 函数指针，不能传 block（block 无法隐式转换为函数指针）。
@@ -330,10 +374,23 @@ void SLFInstallHooks(void) {
 
 void SLFDumpStats(void) {
     @try {
+        // ★ 读这些数字前必须知道它们的覆盖范围，否则会得出完全错误的结论。
+        //
+        // 实测教训（用户 v1.0.0 日志）：
+        //   [stat] viewDidLoad   calls=14 avg=0.00ms
+        //   [stat] viewDidAppear calls=19 avg=0.00ms
+        // 看起来像"界面构建完全不耗时"，但真相是：
+        // 我们只替换了 UIViewController 自身的实现，而它是个**空实现**。
+        // 任何覆写了 viewDidLoad 的子类都有自己方法表条目，调用根本不经过我们，
+        // 所以测到的 14 次全都是没覆写的容器类 → 耗时天然为 0。
+        // 因此这两个数字只能用于"确认 hook 活着"，不能用来判断目标界面快慢。
+        // 判断界面快慢要看 [vc] 行与 [stall] 栈。
         SLFLog(@"[stat] UITableView.reloadData      %@", SLFStatDescribe(&gStatTVReload));
         SLFLog(@"[stat] UICollectionView.reloadData %@", SLFStatDescribe(&gStatCVReload));
-        SLFLog(@"[stat] viewDidLoad                 %@", SLFStatDescribe(&gStatViewDidLoad));
-        SLFLog(@"[stat] viewDidAppear               %@", SLFStatDescribe(&gStatViewDidAppear));
+        SLFLog(@"[stat] viewDidLoad                 %@  （仅覆盖未覆写它的子类，avg=0 属正常）",
+               SLFStatDescribe(&gStatViewDidLoad));
+        SLFLog(@"[stat] viewDidAppear               %@  （同上，勿据此判断目标界面快慢）",
+               SLFStatDescribe(&gStatViewDidAppear));
         SLFLog(@"[stat] performFetch                %@", SLFStatDescribe(&gStatPerformFetch));
     } @catch (__unused NSException *e) {}
 }

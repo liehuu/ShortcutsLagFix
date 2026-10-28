@@ -98,6 +98,40 @@ jobs:
             || { echo "::error::postinst 末尾缺换行"; exit 1; }
           echo "postinst 守卫通过"
 
+      - name: 版本号与预热守卫
+        run: |
+          # 1) 版本号只能有一个真源：control。
+          #    实测事故：SLFCommon.h 曾把版本写死成 "1.0.0"，之后 control 依次
+          #    升到 1.0.1/1.0.2/1.0.3，而三次交付的 dylib 全都自报 v1.0.0，
+          #    害我误以为用户装的是旧包。这条守卫防止它被写回去。
+          if grep -nE '^[[:space:]]*#define[[:space:]]+SLF_VERSION[[:space:]]+"[0-9]' \
+               ShortcutsLagFix/SLFCommon.h; then
+            echo "::error::SLFCommon.h 又把版本号写死了；版本必须由 build.sh 从 control 注入"
+            exit 1
+          fi
+
+          # 2) build.sh 必须真的做了注入。少了它日志会自报 0.0.0-unknown。
+          grep -q 'DSLF_VERSION' build.sh \
+            || { echo "::error::build.sh 未把 SLF_VERSION 注入编译参数"; exit 1; }
+
+          # 3) 预热源文件必须参与编译（否则预热代码只是躺在仓库里）。
+          grep -q 'SLFWarmup.m' build.sh \
+            || { echo "::error::build.sh 的 SOURCES 里没有 SLFWarmup.m"; exit 1; }
+
+          # 4) 预热相关的系统框架必须链接，否则日志里的耗时只会是 0。
+          for fw in CoreText ImageIO NaturalLanguage; do
+            grep -q "framework $fw" build.sh \
+              || { echo "::error::build.sh 未链接 $fw"; exit 1; }
+          done
+
+          # 5) 预置配置要含预热开关，便于用户关闭对比。
+          grep -q 'WarmupEnabled' layout/DEBIAN/postinst \
+            || { echo "::error::postinst 内嵌配置缺 WarmupEnabled"; exit 1; }
+          grep -q 'WarmupDelayMS' layout/DEBIAN/postinst \
+            || { echo "::error::postinst 内嵌配置缺 WarmupDelayMS"; exit 1; }
+
+          echo "版本与预热守卫通过"
+
 
       - name: roothide 包格式专项守卫
         run: |

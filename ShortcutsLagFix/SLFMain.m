@@ -36,13 +36,21 @@ static void SLFMainThreadSetup(void) {
         SLFStartWatchdog();
 
         // hook 安装。内部有 pthread_once 幂等保护。
+        // 注意：子类扫描已经搬进后台队列，所以这一步只花几毫秒
+        // （用户日志里旧版这一步之后还多花了 631ms 扫描全部类，属自身负优化）。
         SLFInstallHooks();
+
+        // 预热一次性系统初始化。内部自己排队到后台并延迟，
+        // 因此这一行本身不产生任何主线程开销。
+        SLFWarmupStart();
 
         SLFLogAlways(@"---------- 初始化完成 ----------");
         SLFLogAlways(@"提示：新建一个快捷指令，然后查看本日志。");
-        SLFLogAlways(@"      [stall] 行 = 卡顿现场栈，直接指出阻塞在哪个函数。");
-        SLFLogAlways(@"      [slow] 行 = 单个方法耗时超阈值。");
-        SLFLogAlways(@"      [vc] 行 = 界面类名，用于确认进入了哪个页面。");
+        SLFLogAlways(@"      [stall] 行 = 卡顿现场。已自动标注「类型」与「本段」；");
+        SLFLogAlways(@"                  同一段持续阻塞会多次上报，切勿把毫秒数累加，");
+        SLFLogAlways(@"                  该段真实总长见紧随其后的「上一段结束」行。");
+        SLFLogAlways(@"      [warmup] 行 = 已提前做掉的一次性初始化，不会再算到点击上。");
+        SLFLogAlways(@"      [slow] 行 = 单个方法耗时超阈值（仅覆盖未覆写该方法的子类）。");
     } @catch (__unused NSException *e) {
         SLFLogAlways(@"主线程初始化异常: %@", e);
     }

@@ -214,7 +214,8 @@ def main(deb_path):
         # 预置配置现在由 postinst 写入（属主 mobile，App 与用户都能改）。
         expected = ["DebugLog", "WatchdogEnabled", "StallThresholdMS",
                     "MaxStallReports", "StatDumpInterval",
-                    "OptDisableImplicitAnimations"]
+                    "OptDisableImplicitAnimations",
+                    "WarmupEnabled", "WarmupDelayMS", "ScanSubclasses"]
         missing = [k for k in expected if k not in txt]
         if missing:
             bad("postinst 内嵌配置缺少键: %s" % ", ".join(missing))
@@ -338,6 +339,13 @@ def main(deb_path):
         "ShortcutsLagFix",
         "已加载",
         "主线程已阻塞",
+        # ★ 以下字符串确认 v1.0.4 的三处新增真的被编进了二进制。
+        # 不查这些的话，CI 万一 checkout 到旧代码，验尸照样全绿 ——
+        # 那等于交付了一个"看起来修好了"的旧包。
+        "[warmup]",                    # 预热子系统
+        "系统一次性初始化",             # 阻塞类型自动分类
+        "主队列拥塞",                   # 断链时的判定分支
+        "补采热点",                     # 断链多采样聚合
     ]
     probes_ascii = [
         b"com.apple.shortcuts",
@@ -360,6 +368,32 @@ def main(deb_path):
     else:
         bad("缺日志兜底路径 'Library/Logs/ShortcutsLagFix' —— "
             "说明编译的是旧代码，日志目录仍可能写不出来")
+
+    # ★ 版本号必须与 control 一致。
+    #
+    # 真实事故：SLFCommon.h 曾把版本写死为 "1.0.0"，之后 control 依次升到
+    # 1.0.1 / 1.0.2 / 1.0.3，而三次交付的 dylib 全都自报 v1.0.0。
+    # 拿到用户日志时我第一反应是"你是不是装了旧包"，白排查一轮。
+    # 现在版本由 build.sh 从 control 注入，且在这里做产物级复核。
+    ctrl_ver = ""
+    try:
+        with open(os.path.join(ROOT, "control"), "rb") as f:
+            for line in f.read().decode("utf-8").split("\n"):
+                if line.startswith("Version:"):
+                    ctrl_ver = line.split(":", 1)[1].strip()
+                    break
+    except OSError:
+        pass
+    if not ctrl_ver:
+        bad("读不到 control 的 Version，无法校验产物版本")
+    else:
+        # C 字符串字面量以 NUL 结尾，用 NUL 边界避免 "1.0.4" 命中 "1.0.40"
+        if (ctrl_ver.encode("ascii") + b"\x00") in embedded or \
+           (ctrl_ver.encode("utf-16-le") in embedded):
+            ok("产物内版本号 = %s（与 control 一致）" % ctrl_ver)
+        else:
+            bad("产物内找不到版本号 %r —— -DSLF_VERSION 未生效，"
+                "日志会自报 0.0.0-unknown，排查时会被误导" % ctrl_ver)
 
     for s in probes_utf16:
         if s.encode("utf-16-le") in embedded:

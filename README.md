@@ -37,7 +37,7 @@ Dopamine-roothide / Bootstrap 环境上，**不需要**再用 roothide Patcher �
 
 ```bash
 # 方式一：直接安装（在设备上，用 Sileo / Zebra / 命令行均可）
-dpkg -i shortcutslagfix_1.0.2_iphoneos-arm64e.deb
+dpkg -i shortcutslagfix_1.0.4_iphoneos-arm64e.deb
 killall -9 Shortcuts
 
 # 方式二：本地编译（需要 macOS + Xcode）
@@ -138,18 +138,84 @@ find /var/mobile/Containers/Data/Application -name "ShortcutsLagFix.log" 2>/dev/
 ### 日志怎么读
 
 ```
-[stall] 主线程已阻塞 1842ms (阈值 250ms) —— 第 1 次
-    主线程 PC=0x1a2b3c4d5
-    #0  Shortcuts   -[WFWorkflowDataSource ...]+0x2c
-    #1  UIKitCore   -[UITableView reloadData]+0x118
+[stall] 主线程已阻塞 1533ms (阈值 250ms) —— 第 24 次
+    类型: 等待（锁 / 条件变量 / 跨进程消息）
+    本段: 自 1.53s 前起，这是同一段阻塞的第 5 次上报（勿累加，段总长请看下面的「上一段结束」行）
+    主线程 PC=0x1db2f8b7c
+    #0  libsystem_kernel.dylib     __psynch_cvwait+0x8
+    #1  Foundation                 0x1c8a30
+    #2  UIKitCore                  0x8c1a4
     ...
 ```
 
-- **`[stall]`** —— 卡顿现场。这是最关键的证据，栈顶几帧就是元凶。
+- **`[stall]`** —— 卡顿现场。栈顶几帧就是元凶。
+- **`类型:`** —— 插件自动归类，直接告诉你这是「等待」「系统一次性初始化」
+  「视图图求值」还是「主队列拥塞」。33 次栈共约 300 行，人肉读极容易看错。
+- **`本段:` / `上一段结束`** —— ⚠️ **同一段持续阻塞会每 100ms 上报一次，毫秒数绝不能累加。**
+  实测某次日志里 5 次上报分别写着 969 / 1304 / 1333 / 1433 / 1533ms，
+  加起来 6572ms，而该段真实长度只有 **1.69 秒**，虚报近 4 倍。
+  真实总长只看 `[stall] 上一段结束：持续 X.XXs`。
+- **`--- 补采热点 ---`** —— 栈断链（帧数太少）时自动隔 10ms 连采 8 次并聚合，
+  给出命中最多的地址。断链的栈本来没有任何信息量，这一步把它救回来。
 - **`[slow]`** —— 单个方法耗时超阈值。
 - **`[vc]`** —— 初始化较慢的界面类名。
-- **`[stat]`** —— 每 `StatDumpInterval` 秒输出一次统计，用于对比开关优化前后的差异。
+- **`[warmup]`** —— 预热各步耗时。这些成本已提前在后台付掉，不会再算到点击上。
+- **`[stat]`** —— 每 `StatDumpInterval` 秒输出统计。注意 `viewDidLoad` /
+  `viewDidAppear` 的 `avg=0.00ms` **属正常**：只 hook 了基类空实现，
+  覆写了它的子类调用不经过插件，这两个数字只能用来看 hook 是否活着。
 - **`[hook]`** —— 每个 hook 的安装结果。若是 `SKIP`，说明该方法不在目标类自身的方法表里。
+
+## 实测诊断结论（v1.0.4 依据）
+
+下面是用户设备（iPhone12,3 / iOS 17.0.3）跑 v1.0.0 得到的真实数据，
+v1.0.4 的改动全部对准这些数字，不是凭空猜的。
+
+**体感量级**：从 13:03:11 到 13:04:04 约 53 秒内，主线程有 **16.65 秒**不可用（约 31%）。
+共 33 次 stall 上报，但按区间合并后是 14 段。
+
+| 段 | 时长 | 栈顶 | 归类 |
+|---|---|---|---|
+| 13:03:36.547 | **4.80s** | CoreFoundation + CFRunLoopRunSpecific | 主队列拥塞（栈断链） |
+| 13:03:32.479 | **3.13s** | `_platform_memmove` → `libz inflate` → ImageIO → `CGDataProviderCopyData` → **WorkflowUIServices** | 图片同步解码 |
+| 13:03:56.934 | 1.69s | `__psynch_cvwait` + Foundation + UIKit + **FLEXing.dylib** | 等待锁 |
+| 13:03:45.304 | 1.53s | `mach_msg2_trap` | 等待消息 |
+| 13:04:02.957 | 1.17s | `semaphore_wait_trap` + **FrontBoardServices** | 跨进程 IPC |
+
+单项热点（可完全消除的一次性初始化）：
+
+| 时长 | 栈 | 处理 |
+|---|---|---|
+| 602ms | `stat` → `CFBurstTrieCreateFromFile` | v1.0.4 预热（词典 trie） |
+| 298ms | `CoreFoundation bsearch` → `CTFontCreateWithFontDescriptor` | v1.0.4 预热（字体） |
+| 285ms | `libmecab` + `CoreNLP` | v1.0.4 预热（语言分析） |
+| 313ms | `objc_getClassList` ← **SLFInstallOnce**（本插件自己） | v1.0.4 移到后台 |
+
+### 插件自身也贡献了卡顿（已修）
+
+第 1 次 stall 的栈里赫然是本插件：
+
+```
+#3  libobjc.A.dylib        objc_getClassList
+#4  ShortcutsLagFix.dylib  SLFInstallOnce
+#8  ShortcutsLagFix.dylib  __SLFScheduleSetup_block_invoke
+```
+
+即 v1.0.0 在主线程上遍历全部已注册类（约 3 万个），耗时 **631ms**
+（日志时间戳 11.353 → 11.984）。这是纯粹的自造卡顿，与要诊断的问题无关。
+v1.0.4 已把这段扫描移到 `QOS_CLASS_BACKGROUND` 后台队列，并每 1000 个类让出一次
+runtime 锁（长时间持锁会让主线程的 msgSend 慢路径等锁，等于把卡顿换个名字）。
+
+### 明确修不了的部分（不假装能修）
+
+- **ImageIO 3.13s**：App 在渲染图库图标时同步解压整张图，未做降采样。
+  拦截 `CGDataProviderCopyData` 或篡改返回的 CGImage 尺寸会破坏布局，
+  风险远大于收益。预热只能省掉库加载那一小段，省不掉解压本身。
+- **SwiftUI / AttributeGraph**：14 段涉及视图图求值，最多的一段 3.1s。
+  这是 App 自身的 body 重算，插件无法在不改变渲染结果的前提下降本。
+- **FrontBoardServices 903ms**：主线程同步等 SpringBoard 的跨进程调用。
+- **FLEXing.dylib**：你的设备装了 FLEX 调试工具（出现在 5 段里，涉及 4.45s）。
+  它会 hook 大量 UIView 方法并参与 UI 构建链。**建议关掉它再对比一次**，
+  否则测到的卡顿里混着调试器的开销。
 
 ## 配置
 
@@ -167,6 +233,13 @@ find /var/mobile/Containers/Data/Application -name "ShortcutsLagFix.log" 2>/dev/
 | `MaxStallReports` | int | `40` | 单次运行最多抓栈次数 |
 | `StatDumpInterval` | int | `30` | 统计输出间隔（秒），0 = 关闭 |
 | `OptDisableImplicitAnimations` | bool | `true` | reload 期间关闭隐式动画 |
+| `WarmupEnabled` | bool | `true` | 后台预热一次性系统初始化（v1.0.4 新增） |
+| `WarmupDelayMS` | int | `1500` | 预热启动延迟，给 App 启动让路（v1.0.4 新增） |
+| `ScanSubclasses` | bool | `true` | 后台扫描覆写 reloadData 的子类（v1.0.4 新增） |
+
+> 升级安装时**不会**覆盖已有的配置文件（避免丢掉你的调参），
+> 所以上表最后三行在旧配置里可能不存在 —— 缺键时用内置默认值，功能正常。
+> 想关掉预热做 A/B 对比，手工加一行 `<key>WarmupEnabled</key><false/>` 即可。
 
 ## 安全设计
 

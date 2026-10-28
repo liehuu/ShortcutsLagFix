@@ -39,6 +39,11 @@ for d in /var/mobile/Library/Logs /var/mobile/Library/Preferences; do
 done
 
 # 预置配置：只在不存在时写入，不覆盖用户已有配置。
+#
+# 注意：升级安装时这个文件已存在，**不会**被覆盖，所以新版本新增的键
+# 不会自动出现在旧配置里。这是有意的 —— 覆盖会丢掉用户的调参。
+# 代码侧每个键都有合理的默认值，缺键不影响功能；
+# 想改新键（WarmupEnabled / WarmupDelayMS / ScanSubclasses）需手工添加。
 CONF=/var/mobile/Library/Preferences/com.liehuu.shortcutslagfix.plist
 if [ ! -f "$CONF" ]; then
     mkdir -p /var/mobile/Library/Preferences 2>/dev/null || true
@@ -58,6 +63,12 @@ if [ ! -f "$CONF" ]; then
 	<key>StatDumpInterval</key>
 	<integer>30</integer>
 	<key>OptDisableImplicitAnimations</key>
+	<true/>
+	<key>WarmupEnabled</key>
+	<true/>
+	<key>WarmupDelayMS</key>
+	<integer>1500</integer>
+	<key>ScanSubclasses</key>
 	<true/>
 </dict>
 </plist>

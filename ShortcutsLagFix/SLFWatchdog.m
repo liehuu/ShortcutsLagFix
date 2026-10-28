@@ -25,6 +25,9 @@
 #import <mach/arm/thread_status.h>
 #import <pthread.h>
 #import <dlfcn.h>
+#import <unistd.h>
+#import <string.h>
+#import <stdio.h>
 #import <CoreFoundation/CoreFoundation.h>
 
 // 注意：不要 #import <mach/mach_vm.h>。
@@ -80,46 +83,40 @@ void SLFWatchdogHealthCheck(void);
   #define SLFGetLR(st) ((uint64_t)((st)->__lr))
 #endif
 
+// 一次抓栈的结果。改成结构体而不是直接拼字符串，是为了让"分类"和
+// "多次采样聚合热点"能在同一份数据上做，而不是对着字符串正则反向解析。
+typedef struct {
+    uint64_t addrs[SLF_MAX_FRAMES];
+    int n;
+    uint64_t pc;
+} SLFStackTrace;
+
 // noinline：保证这些函数自己在栈上有独立帧，不会被优化掉导致回溯错位。
 __attribute__((noinline))
-static void SLFCaptureThreadStack(mach_port_t thread, NSString **outText) {
-    if (thread == MACH_PORT_NULL) {
-        *outText = @"(无法获取主线程 mach port)";
-        return;
-    }
+static void SLFCaptureStack(mach_port_t thread, SLFStackTrace *out) {
+    memset(out, 0, sizeof(*out));
+    if (thread == MACH_PORT_NULL) return;
 
 #if defined(__arm64__) || defined(__aarch64__)
     arm_thread_state64_t state;
     mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
     kern_return_t kr = thread_get_state(thread, ARM_THREAD_STATE64,
                                         (thread_state_t)&state, &count);
-    if (kr != KERN_SUCCESS) {
-        *outText = [NSString stringWithFormat:@"(thread_get_state 失败 kr=%d)", kr];
-        return;
-    }
+    if (kr != KERN_SUCCESS) return;
 
     // ★ arm64e 关键差异：__pc / __fp / __lr 是带指针认证（PAC）的字段，
     // 不能直接当 uint64_t 读 —— 在 arm64e 上直接访问会拿到带签名位的值，
     // 甚至编译告警。必须走 SDK 提供的访问器，它们内部会正确剥离签名。
-    uint64_t pc = SLFGetPC(&state);
-    uint64_t fp = SLFGetFP(&state);
-    uint64_t lr = SLFGetLR(&state);
-    pc = SLF_STRIP(pc);
-    fp = SLF_STRIP(fp);
-    lr = SLF_STRIP(lr);
+    uint64_t pc = SLF_STRIP(SLFGetPC(&state));
+    uint64_t fp = SLF_STRIP(SLFGetFP(&state));
+    uint64_t lr = SLF_STRIP(SLFGetLR(&state));
 
-    NSMutableString *sb = [NSMutableString string];
-    [sb appendFormat:@"    主线程 PC=0x%llx\n", pc];
-
-    task_t task = mach_task_self();
-    uint64_t addrs[SLF_MAX_FRAMES];
+    out->pc = pc;
     int n = 0;
+    out->addrs[n++] = pc;
 
-    // 第 0 帧是当前 PC
-    addrs[n++] = pc;
-
-    // 沿 frame pointer 链回溯。
-    // 每个 fp 指向 {previous_fp, return_address}。
+    // 沿 frame pointer 链回溯。每个 fp 指向 {previous_fp, return_address}。
+    task_t task = mach_task_self();
     uint64_t curFP = fp;
     for (int i = 1; i < SLF_MAX_FRAMES && curFP != 0; i++) {
         uint64_t frame[2] = {0, 0};
@@ -134,47 +131,175 @@ static void SLFCaptureThreadStack(mach_port_t thread, NSString **outText) {
         uint64_t nextFP = SLF_STRIP(frame[0]);
         uint64_t retAddr = SLF_STRIP(frame[1]);
 
-        if (retAddr != 0) {
-            if (n < SLF_MAX_FRAMES) addrs[n++] = retAddr;
-        }
+        if (retAddr != 0 && n < SLF_MAX_FRAMES) out->addrs[n++] = retAddr;
         // 栈必须向高地址增长；不满足说明链已断裂或数据异常，立刻停止。
         if (nextFP <= curFP) break;
         curFP = nextFP;
     }
 
     // 若回溯一帧都没拿到，至少把 LR 报出来（通常已能定位直接调用方）。
-    if (n == 1 && lr != 0 && n < SLF_MAX_FRAMES) {
-        addrs[n++] = lr;
-    }
+    if (n == 1 && lr != 0) out->addrs[n++] = lr;
 
-    for (int i = 0; i < n; i++) {
-        Dl_info info;
-        const char *img = "?";
-        const char *sym = NULL;
-        uint64_t off = 0;
-
-        if (dladdr((const void *)addrs[i], &info) != 0) {
-            if (info.dli_fname) {
-                img = strrchr(info.dli_fname, '/');
-                img = img ? img + 1 : info.dli_fname;
-            }
-            sym = info.dli_sname;
-            if (info.dli_saddr) {
-                off = addrs[i] - (uint64_t)(uintptr_t)info.dli_saddr;
-            }
-        }
-
-        if (sym) {
-            [sb appendFormat:@"    #%-2d %-28s %s+0x%llx\n", i, img, sym, off];
-        } else {
-            [sb appendFormat:@"    #%-2d %-28s 0x%llx\n", i, img, addrs[i]];
-        }
-    }
-
-    *outText = sb;
-#else
-    *outText = @"(非 arm64 架构，栈回溯未实现)";
+    out->n = n;
 #endif
+}
+
+// 取地址所属 image 的短名与"相对 image 基址"的偏移。
+//
+// ★ 为什么必须用 image 基址而不是符号偏移（实测缺陷）：
+//   旧实现算的是 addr - dli_saddr。dladdr 对没有导出符号的帧会返回
+//   "最近的导出符号"，该符号地址可能**大于**目标地址，相减得到天文数字，
+//   于是日志里出现 <redacted>+0x7e0000000024 这种偏移。
+//   那种偏移量无法用于任何符号化工具，等于白抓。
+//   改成相对 dli_fbase 之后，输出形如 UIKitCore+0x8c1a4，可以直接
+//   用 atos / 崩溃日志对照定位，这才是可用的证据。
+static const char *SLFImageNameAndOffset(uint64_t addr, uint64_t *outOff, const char **outSym) {
+    static char buf[64];        // 单线程使用（看门狗串行），无需加锁
+    Dl_info info;
+    *outOff = 0;
+    *outSym = NULL;
+
+    if (dladdr((const void *)(uintptr_t)addr, &info) == 0) {
+        snprintf(buf, sizeof(buf), "?");
+        return buf;
+    }
+
+    const char *img = "?";
+    if (info.dli_fname) {
+        const char *slash = strrchr(info.dli_fname, '/');
+        img = slash ? slash + 1 : info.dli_fname;
+    }
+    snprintf(buf, sizeof(buf), "%s", img);
+
+    uint64_t base = (uint64_t)(uintptr_t)info.dli_fbase;
+    if (base != 0 && addr >= base) *outOff = addr - base;
+
+    // 只有当符号地址确实小于等于目标地址时，符号偏移才有意义。
+    if (info.dli_sname && info.dli_saddr &&
+        (uint64_t)(uintptr_t)info.dli_saddr <= addr) {
+        *outSym = info.dli_sname;
+        *outOff = addr - (uint64_t)(uintptr_t)info.dli_saddr;
+    }
+    return buf;
+}
+
+__attribute__((noinline))
+static NSString *SLFRenderStack(const SLFStackTrace *st) {
+    NSMutableString *sb = [NSMutableString string];
+    [sb appendFormat:@"    主线程 PC=0x%llx\n", st->pc];
+
+    if (st->n == 0) {
+        [sb appendString:@"    (抓栈失败：thread_get_state 未成功)\n"];
+        return sb;
+    }
+
+    for (int i = 0; i < st->n; i++) {
+        uint64_t off = 0;
+        const char *sym = NULL;
+        const char *img = SLFImageNameAndOffset(st->addrs[i], &off, &sym);
+        if (sym != NULL) {
+            [sb appendFormat:@"    #%-2d %-26s %s+0x%llx\n", i, img, sym, off];
+        } else {
+            // 无符号：给出 image 相对偏移，可直接拿去 symbolicate。
+            [sb appendFormat:@"    #%-2d %-26s 0x%llx\n", i, img, off];
+        }
+    }
+    return sb;
+}
+
+#pragma mark - 阻塞类型自动分类
+
+// 把栈顶若干帧的 image/符号名映射成人能直接用的结论。
+//
+// 目的：33 次 stall、约 300 行栈，人肉读极容易看错（我自己就把
+// "<redacted>+0x74" 当成了有意义的证据）。分类之后一眼能看出
+// "这是等锁" vs "这是系统初始化" vs "这是视图重算"。
+// 判定只依据栈形状与 image 名，不做任何猜测性推断。
+static NSString *SLFClassifyStack(const SLFStackTrace *st) {
+    if (st->n == 0) return @"未知（抓栈失败）";
+
+    // 只看前 6 帧：更深的帧通常是 runloop 外壳，对归因没有帮助。
+    int limit = st->n < 6 ? st->n : 6;
+    BOOL sawRunLoopOnly = YES;
+
+    for (int i = 0; i < limit; i++) {
+        uint64_t off = 0;
+        const char *sym = NULL;
+        const char *img = SLFImageNameAndOffset(st->addrs[i], &off, &sym);
+        NSString *s = sym ? [NSString stringWithUTF8String:sym] : @"";
+        NSString *im = [NSString stringWithUTF8String:img];
+
+        // 同步等待类：锁、条件变量、IPC、消息队列
+        if ([s hasPrefix:@"__psynch_cvwait"] || [s hasPrefix:@"semaphore_wait_trap"] ||
+            [s hasPrefix:@"mach_msg2_trap"] || [s hasPrefix:@"mach_msg_overwrite"] ||
+            [s hasPrefix:@"__ulock_wait"] || [s hasPrefix:@"__ulock_wake"] ||
+            [s hasPrefix:@"__semwait_signal"]) {
+            return @"等待（锁 / 条件变量 / 跨进程消息）";
+        }
+        // 系统一次性初始化：这些正是预热要对准的目标
+        if ([im containsString:@"ImageIO"] || [im containsString:@"libz"] ||
+            [im containsString:@"CoreText"] || [im containsString:@"libmecab"] ||
+            [im containsString:@"CoreNLP"] || [im containsString:@"CoreUI"]) {
+            return @"系统一次性初始化（可被预热移出主线程）";
+        }
+        if ([s hasPrefix:@"CFBurstTrieCreate"]) {
+            return @"系统一次性初始化（词典 trie，可被预热移出主线程）";
+        }
+        // 视图图求值 / Swift 运行时
+        if ([im containsString:@"AttributeGraph"] || [im containsString:@"SwiftUI"] ||
+            [im containsString:@"libswiftCore"]) {
+            return @"视图图求值（App 自身的 SwiftUI 重算）";
+        }
+        if (![s hasPrefix:@"CFRunLoopRunSpecific"] && ![im isEqualToString:@"?"]) {
+            sawRunLoopOnly = NO;
+        }
+    }
+
+    // 只有 runloop 外壳 + 帧数很少：心跳没跑到，但主线程在跑 runloop。
+    // 这只能是主队列上排了大量 block，把心跳压在了后面。
+    if (sawRunLoopOnly || st->n < 6) {
+        return @"主队列拥塞（栈已断链，心跳被排在大量 block 之后）";
+    }
+    return @"其他（见下方栈）";
+}
+
+// 断链补采：单次抓栈拿不到几帧时，隔 10ms 连采若干次，
+// 把出现的地址聚合成"热点"，输出出现最多的前几个。
+// 这是把 9 次断链（累计 7.48 秒）从"无信息"变成"有信息"的唯一办法。
+static NSString *SLFSampleHotspots(mach_port_t thread, int rounds) {
+    NSMutableDictionary<NSString *, NSNumber *> *hits = [NSMutableDictionary dictionary];
+
+    for (int r = 0; r < rounds; r++) {
+        SLFStackTrace st;
+        SLFCaptureStack(thread, &st);
+        for (int i = 0; i < st.n && i < 2; i++) {   // 只看每个样本的最内两帧
+            uint64_t off = 0;
+            const char *sym = NULL;
+            const char *img = SLFImageNameAndOffset(st.addrs[i], &off, &sym);
+            // 立刻格式化成 NSString：SLFImageNameAndOffset 返回的是静态缓冲区，
+            // 下一次调用会覆盖它，不能保存指针。
+            NSString *k = sym
+                ? [NSString stringWithFormat:@"%s %s+0x%llx", img, sym, off]
+                : [NSString stringWithFormat:@"%s 0x%llx", img, off];
+            hits[k] = @([hits[k] integerValue] + 1);
+        }
+        usleep(10 * 1000);
+    }
+
+    if (hits.count == 0) return @"(补采亦无结果)";
+
+    NSArray *sorted = [hits keysSortedByValueUsingComparator:^NSComparisonResult(id a, id b) {
+        return [hits[b] compare:hits[a]];
+    }];
+    NSMutableString *sb = [NSMutableString string];
+    int shown = 0;
+    for (NSString *k in sorted) {
+        if (shown >= 4) break;
+        [sb appendFormat:@"    hot #%d  %@   命中 %@/%d\n",
+         shown, k, hits[k], rounds];
+        shown++;
+    }
+    return sb;
 }
 
 #pragma mark - 主线程心跳
@@ -187,6 +312,47 @@ static void SLFTouchPort(void) {
 
 static void SLFPumpBeat(void) {
     atomic_store(&gLastBeatNS, SLFNowNS());
+}
+
+// 供预热模块使用：主线程是否仍在正常响应。
+// 判据是"最近 200ms 内刷新过心跳"，比卡顿阈值(250ms)略严，
+// 这样预热会在主线程刚开始变慢时就退让，而不是等到已经判为卡顿。
+BOOL SLFMainThreadResponsive(void) {
+    uint64_t last = atomic_load(&gLastBeatNS);
+    if (last == 0) return YES;          // 心跳尚未开始
+    uint64_t now = SLFNowNS();
+    if (now < last) return YES;         // 时钟异常，按正常处理
+    return (now - last) < 200ULL * NSEC_PER_MSEC;
+}
+
+#pragma mark - 段（segment）跟踪
+
+// ★ 为什么必须做段跟踪（这次实测踩到的统计陷阱）：
+//   主线程持续卡住时，看门狗每 100ms 报一次，而每次的 deltaMS 都比上次大 100ms。
+//   用户日志里 #20~#24 分别是 969 / 1304 / 1333 / 1433 / 1533ms，
+//   如果直接相加得 6572ms，而按区间合并后只有 1.69 秒 —— 虚报近 4 倍。
+//   我自己第一遍就被这个数字骗过（算出"累计 28.77 秒"，真实是 16.65 秒）。
+//   所以要把"同一段持续阻塞"显式合并展示，并明确标注"勿累加"。
+static _Atomic uint64_t gSegStartNS = 0;    // 当前段起点
+static _Atomic uint64_t gSegEndNS   = 0;    // 当前段最近一次观测时刻
+static _Atomic int      gSegReports = 0;    // 本段已被上报的次数
+
+static void SLFSegmentSummaryAndReset(void) {
+    uint64_t s = atomic_load(&gSegStartNS);
+    if (s == 0) return;
+    uint64_t e = atomic_load(&gSegEndNS);
+    int n = atomic_load(&gSegReports);
+    if (e >= s && n > 0) {
+        double durS = (double)(e - s) / 1e9;
+        // 只有持续够久或上报次数够多才值得单独总结，避免短抖动刷屏。
+        if (durS >= 0.5 || n >= 3) {
+            SLFLogAlways(@"[stall] 上一段结束：持续 %.2fs，期间上报 %d 次"
+                          "（同一段只算一次，请勿把上报次数或毫秒数累加）", durS, n);
+        }
+    }
+    atomic_store(&gSegStartNS, 0);
+    atomic_store(&gSegEndNS, 0);
+    atomic_store(&gSegReports, 0);
 }
 
 #pragma mark - 看门狗主循环
@@ -203,7 +369,11 @@ static void SLFWatchdogTick(void) {
     uint64_t deltaMS = (now - last) / 1000000ULL;
     NSInteger threshold = SLFInt(@"StallThresholdMS", 250);
 
-    if ((NSInteger)deltaMS < threshold) return;
+    if ((NSInteger)deltaMS < threshold) {
+        // 主线程已恢复：结算上一段。
+        SLFSegmentSummaryAndReset();
+        return;
+    }
 
     // ---- 进入卡顿上报路径 ----
 
@@ -224,17 +394,60 @@ static void SLFWatchdogTick(void) {
     }
     atomic_store(&gReportCount, done + 1);
 
+    // ---- 段归属判定 ----
+    uint64_t stallStart = now - deltaMS * 1000000ULL;
+    uint64_t segStart = atomic_load(&gSegStartNS);
+    BOOL continuation = NO;
+    // 容差 300ms：tick 间隔 100ms，同一段内的上报彼此不会差太远；
+    // 若起点比当前段起点晚 300ms 以上，说明中间主线程恢复过，是新的一段。
+    if (segStart != 0 && stallStart <= segStart + 300ULL * 1000000ULL) {
+        continuation = YES;
+    } else {
+        // 新的一段开始：先把上一段结算掉（若存在）。
+        SLFSegmentSummaryAndReset();
+        atomic_store(&gSegStartNS, stallStart);
+        segStart = stallStart;
+    }
+    atomic_store(&gSegEndNS, now);
+    atomic_store(&gSegReports, atomic_load(&gSegReports) + 1);
+    int segN = atomic_load(&gSegReports);
+    double segDurS = (double)(now - segStart) / 1e9;
+
     // 在后台线程抓主线程栈：此刻主线程正卡着，栈就是现场。
-    NSString *stack = nil;
+    SLFStackTrace st;
     @try {
-        SLFCaptureThreadStack((mach_port_t)atomic_load(&gMainThreadPort), &stack);
+        SLFCaptureStack((mach_port_t)atomic_load(&gMainThreadPort), &st);
     } @catch (__unused NSException *e) {
-        stack = @"(抓栈异常)";
+        memset(&st, 0, sizeof(st));
     }
 
-    SLFLogAlways(@"[stall] 主线程已阻塞 %llums (阈值 %ldms) —— 第 %d 次\n%@",
-                 deltaMS, (long)threshold, done + 1, stack ?: @"(无栈)");
+    NSString *kind = SLFClassifyStack(&st);
 
+    // 断链补采：帧数太少时单次栈没有信息量，隔 10ms 连采几次聚合热点。
+    NSString *hot = nil;
+    if (st.n < 6) {
+        @try {
+            hot = SLFSampleHotspots((mach_port_t)atomic_load(&gMainThreadPort), 8);
+        } @catch (__unused NSException *e) {}
+    }
+
+    NSMutableString *out = [NSMutableString string];
+    [out appendFormat:@"[stall] 主线程已阻塞 %llums (阈值 %ldms) —— 第 %d 次\n",
+                      deltaMS, (long)threshold, done + 1];
+    [out appendFormat:@"    类型: %@\n", kind];
+    if (continuation) {
+        [out appendFormat:@"    本段: 自 %0.2fs 前起，这是同一段阻塞的第 %d 次上报"
+                          "（勿累加，段总长请看下面的「上一段结束」行）\n", segDurS, segN];
+    } else {
+        [out appendFormat:@"    本段: 新的一段开始\n"];
+    }
+    [out appendString:SLFRenderStack(&st)];
+    if (hot != nil) {
+        [out appendString:@"    --- 补采热点（栈已断链，以下为 8 次采样的聚合）---\n"];
+        [out appendString:hot];
+    }
+
+    SLFLogAlways(@"%@", out);
     atomic_store(&gLastReportedNS, now);
 
     // 必释闸门。放在抓栈之后、且无任何提前 return 的路径上。
