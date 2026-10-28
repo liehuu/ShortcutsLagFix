@@ -365,6 +365,27 @@ def check_set_but_unused(f, lines):
             warn(f, 1, "[17] static %s 只赋值从不读取（-Wunused-but-set-variable）" % var)
 
 
+# ---------- [18] 测试脚本不得写生产目录 ----------
+def check_test_isolation():
+    """确保 test_*.py 不直接修改 layout/ 或 build/ 里的真实文件。
+
+    2026-10-28 真实事故：test_pack.py 为了验证"缺文件必须拦截"，
+    删掉了 layout/var/mobile/Library/Preferences/*.plist。
+    那是真实交付文件 —— 随后提交推送的仓库就缺了预置配置，
+    CI 打包时报 "缺少预置配置文件"，白跑一轮。
+    教训：测试必须重定向到临时目录，并且允许保留删除动作（它本身是对的，
+    只是必须作用在临时副本上）。
+    """
+    fpath = os.path.join(ROOT, "test_pack.py")
+    if not os.path.exists(fpath):
+        return
+    with open(fpath, encoding="utf-8") as f:
+        body = f.read()
+    if "pack.LAYOUT" in body and "tempfile" not in body:
+        err("test_pack.py", 0,
+            "[18] 测试脚本改写了生产 layout/ 却未重定向到临时目录（会删真实文件）")
+
+
 def main():
     files = sources()
     if not files:
@@ -390,6 +411,8 @@ def main():
         check_constructor(f, lines)
         check_ios_headers(f, lines)
         check_set_but_unused(f, lines)
+
+    check_test_isolation()
 
     for w in warnings:
         print("[WARN] " + w)

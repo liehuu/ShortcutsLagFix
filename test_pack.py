@@ -54,8 +54,21 @@ def parse_ar(path):
 
 
 def main():
-    print("=== 1. 构造伪造 dylib ===")
-    os.makedirs(pack.BUILD, exist_ok=True)
+    # ★ 关键：把 pack 的工作目录全部重定向到临时目录。
+    # 早期版本直接改写真实 layout/ 与 build/，第 8 步为了验证"缺文件必须拦截"
+    # 会删掉 layout 里的配置文件 —— 结果把真实交付文件一起删了，
+    # 导致随后提交推送的仓库缺少预置 plist，CI 报 "缺少预置配置文件"。
+    # 测试必须与生产文件隔离：这是原则，不是可选项。
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="slf_test_")
+    pack.BUILD = os.path.join(tmp, "build")
+    pack.LAYOUT = os.path.join(tmp, "layout")
+    pack.OUTDEB = os.path.join(tmp, "debs")
+    pack.DYLIB = os.path.join(pack.BUILD, "ShortcutsLagFix.dylib")
+    for d in (pack.BUILD, pack.LAYOUT, pack.OUTDEB):
+        os.makedirs(d, exist_ok=True)
+
+    print("=== 1. 构造伪造 dylib（临时目录 %s）===" % tmp)
     fake = b"\xca\xfe\xba\xbe" + b"FAKE_DYLIB_FOR_PACK_TEST" * 10 + b"\x01"  # 奇数长度
     with open(pack.DYLIB, "wb") as f:
         f.write(fake)
@@ -149,9 +162,10 @@ def main():
     except SystemExit as e:
         print("    正确拦截（exit %s）" % e.code)
 
-    # 清理测试产物
+    # 清理测试产物（只清临时目录，绝不碰真实 layout/）
     if os.path.exists(deb):
         os.remove(deb)
+    shutil.rmtree(tmp, ignore_errors=True)
     print("\n=== 全部通过 ===")
     return 0
 

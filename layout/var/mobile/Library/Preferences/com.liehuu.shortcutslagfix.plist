@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- 日志总开关。默认 true：诊断工具的核心价值就是拿到日志，
+	     默认关掉会让用户白跑一次安装。 -->
+	<key>DebugLog</key>
+	<true/>
+
+	<!-- 主线程卡顿监测。默认开启，这是定位问题的唯一手段。 -->
+	<key>WatchdogEnabled</key>
+	<true/>
+
+	<!-- 主线程连续阻塞超过该毫秒数就抓一次现场栈。
+	     250ms 是用户能明确感知"卡了"的量级。 -->
+	<key>StallThresholdMS</key>
+	<integer>250</integer>
+
+	<!-- 单次 App 生命周期内最多抓多少次栈，防止极端情况下日志爆炸。 -->
+	<key>MaxStallReports</key>
+	<integer>40</integer>
+
+	<!-- 每隔多少秒输出一次各 hook 的耗时统计；0 = 关闭。 -->
+	<key>StatDumpInterval</key>
+	<integer>30</integer>
+
+	<!-- 优化：在 UITableView/UICollectionView 的 reloadData 期间关闭隐式动画。
+	     只关动画，不改数据流，语义无损。默认开启。 -->
+	<key>OptDisableImplicitAnimations</key>
+	<true/>
+</dict>
+</plist>

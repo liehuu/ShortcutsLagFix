@@ -44,12 +44,8 @@
 #pragma mark - 心跳
 
 static _Atomic uint64_t gLastBeatNS = 0;
-static _Atomic bool gBeatPending = false;
 static _Atomic uint32_t gMainThreadPort = 0;
 static _Atomic bool gWatchdogRunning = false;
-
-// 卡顿时长统计（用于日志摘要，不参与判定）
-static SLFStat gStallStat;
 
 // 定时器强引用。
 // 必须集中持有并被真正读取：dispatch_source 一旦被释放，其事件处理器会静默停止触发
