@@ -36,12 +36,31 @@
 Dopamine-roothide / Bootstrap 环境上，**不需要**再用 roothide Patcher 转换。
 
 ```bash
-# 方式一：直接安装 CI 产物（在设备上，用 Sileo / Zebra / 命令行均可）
-dpkg -i shortcutslagfix_1.0.1_iphoneos-arm64e.deb
+# 方式一：直接安装（在设备上，用 Sileo / Zebra / 命令行均可）
+dpkg -i shortcutslagfix_1.0.2_iphoneos-arm64e.deb
+killall -9 Shortcuts
 
 # 方式二：本地编译（需要 macOS + Xcode）
 ./build.sh && python3 pack.py
 ```
+
+> 装完必须 `killall -9 Shortcuts`，否则已运行的进程不会加载新 dylib。
+
+### 关于 control 文件（第二个踩过的坑）
+
+`control` **最后一个字段的值必须由换行符 `\n` 终结**。少了这一个字节，dpkg 会直接拒绝安装：
+
+```
+parsing file '/Library/dpkg/tmp.ci/control' near line 8
+package 'com.liehuu.shortcutslagfix':
+end of file during value of field 'Depends' (missing final newline)
+```
+
+`pack.py` 里的 `validate_control_text()` 会对**真正打进包的原始字节**做校验
+（末尾换行 / CR 污染 / 空行 / `Key: value` 语法），CI 也有一道独立守卫。
+
+⚠️ 注意校验时必须读原始字节：任何 `strip()`、`splitlines()`、`$(cat control)`
+都会**静默吃掉尾随换行**，等于把要找的缺陷抹掉后再去检查它。
 
 ### 关于 Architecture 字段（踩过的坑，写在这里避免重复）
 
