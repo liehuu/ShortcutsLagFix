@@ -118,25 +118,6 @@ static int SLFMainThreadRunState(uint64_t *outCPUms) {
     return bi.run_state;
 }
 
-// 只看主线程 PC，不做回溯。
-// 用途：每个 tick 都要判断"PC 是否停在同一条指令上"，而完整回溯有开销，
-// 不能为了这个判据每 100ms 抓一次整条栈。
-static uint64_t SLFPeekMainPC(void) {
-    mach_port_t th = (mach_port_t)atomic_load(&gMainThreadPort);
-    if (th == MACH_PORT_NULL) return 0;
-#if defined(__arm64__) || defined(__aarch64__)
-    arm_thread_state64_t state;
-    mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
-    if (thread_get_state(th, ARM_THREAD_STATE64, (thread_state_t)&state, &count)
-        != KERN_SUCCESS) {
-        return 0;
-    }
-    return SLF_STRIP(SLFGetPC(&state));
-#else
-    return 0;
-#endif
-}
-
 #pragma mark - 栈回溯
 
 #define SLF_MAX_FRAMES 48
@@ -214,6 +195,26 @@ static void SLFCaptureStack(mach_port_t thread, SLFStackTrace *out) {
     out->n = n;
 #endif
 }
+
+// 只看主线程 PC，不做回溯。
+// 用途：每个 tick 都要判断"PC 是否停在同一条指令上"，而完整回溯有开销，
+// 不能为了这个判据每 100ms 抓一次整条栈。
+static uint64_t SLFPeekMainPC(void) {
+    mach_port_t th = (mach_port_t)atomic_load(&gMainThreadPort);
+    if (th == MACH_PORT_NULL) return 0;
+#if defined(__arm64__) || defined(__aarch64__)
+    arm_thread_state64_t state;
+    mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
+    if (thread_get_state(th, ARM_THREAD_STATE64, (thread_state_t)&state, &count)
+        != KERN_SUCCESS) {
+        return 0;
+    }
+    return SLF_STRIP(SLFGetPC(&state));
+#else
+    return 0;
+#endif
+}
+
 
 // 单个 image 的合理上限。dyld shared cache 里最大的库也就几百 MB，
 // 超过 1GB 的"偏移"一定是地址被污染，不可能是真实偏移。
