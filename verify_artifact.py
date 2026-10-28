@@ -16,6 +16,7 @@
 """
 
 import os
+import re
 import sys
 import struct
 import tarfile
